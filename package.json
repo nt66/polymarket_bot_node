@@ -1,0 +1,32 @@
+{
+  "name": "polymarket-bot-node",
+  "version": "1.0.0",
+  "description": "Polymarket BTC 15min arbitrage bot",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js start",
+    "stop": "node dist/index.js stop",
+    "dev": "tsx src/index.ts start",
+    "test:connection": "tsx src/test-connection.ts"
+  },
+  "keywords": ["polymarket", "arbitrage", "btc", "crypto"],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@ethersproject/wallet": "^5.7.0",
+    "@polymarket/clob-client": "^4.0.0",
+    "dotenv": "^16.4.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
