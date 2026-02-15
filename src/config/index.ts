@@ -43,9 +43,20 @@ export interface EnvConfig {
 
   // 巩固/加强：入场与仓位（可 .env 覆盖）
   trendMinBid: number;        // TREND 入场：赢方 bid 至少多少（提高=少而准）
-  endgameMaxAsk: number;      // ENDGAME 入场：ask 不超过多少（提高=多接末日轮）
+  endgameMaxAsk: number;      // ENDGAME 入场：ask 不超过多少（降低=只接高置信度）
+  endgameStopLoss: number;    // ENDGAME 止损：bid 跌超此阈值就砍（v5 新增，不再死扛）
   maxPositionPerMarket: number;  // 单市场最大占用 USDC
   maxTradesPerWindow: number;    // 单窗口最多几笔
+
+  // 跟单模式
+  botMode: "scalp" | "copy";            // 运行模式：scalp=原策略, copy=跟单
+  copyTargetAddress: string;             // 跟单目标的钱包地址
+  copySize: number;                      // 每笔跟单最大股数（实际按预算换算可能更小）
+  copyMinPrice: number;                  // 只跟价格 >= 此值的交易
+  copyMaxPrice: number;                  // 只跟价格 <= 此值的交易
+  copyMaxPendingCost: number;            // 未结算持仓总成本上限 (USDC)
+  copyMaxBudget: number;                 // 跟单总预算 (USDC)，不超过此金额在仓
+  copyMaxAgeSeconds: number;             // 超过此秒数的交易视为太旧不跟（Data API 有延迟，建议 300）
 }
 
 const defaultConfig: EnvConfig = {
@@ -68,9 +79,19 @@ const defaultConfig: EnvConfig = {
   btc15MinSlug: "",
 
   trendMinBid: 0.65,
-  endgameMaxAsk: 0.95,
+  endgameMaxAsk: 0.88,
+  endgameStopLoss: 0.20,
   maxPositionPerMarket: 8,
   maxTradesPerWindow: 2,
+
+  botMode: "scalp",
+  copyTargetAddress: "",
+  copySize: 5,
+  copyMinPrice: 0.15,
+  copyMaxPrice: 0.95,
+  copyMaxPendingCost: 20,
+  copyMaxBudget: 50,
+  copyMaxAgeSeconds: 300,
 };
 
 function parseBool(val: string | undefined, def: boolean): boolean {
@@ -115,8 +136,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
 
     trendMinBid: parseNum(env.TREND_MIN_BID, defaultConfig.trendMinBid),
     endgameMaxAsk: parseNum(env.ENDGAME_MAX_ASK, defaultConfig.endgameMaxAsk),
+    endgameStopLoss: parseNum(env.ENDGAME_STOP_LOSS, defaultConfig.endgameStopLoss),
     maxPositionPerMarket: parseNum(env.MAX_POSITION_PER_MARKET, defaultConfig.maxPositionPerMarket),
     maxTradesPerWindow: parseNum(env.MAX_TRADES_PER_WINDOW, defaultConfig.maxTradesPerWindow),
+
+    botMode: (env.BOT_MODE === "copy" ? "copy" : "scalp") as "scalp" | "copy",
+    copyTargetAddress: env.COPY_TARGET_ADDRESS ?? defaultConfig.copyTargetAddress,
+    copySize: parseNum(env.COPY_SIZE, defaultConfig.copySize),
+    copyMinPrice: parseNum(env.COPY_MIN_PRICE, defaultConfig.copyMinPrice),
+    copyMaxPrice: parseNum(env.COPY_MAX_PRICE, defaultConfig.copyMaxPrice),
+    copyMaxPendingCost: parseNum(env.COPY_MAX_PENDING_COST, defaultConfig.copyMaxPendingCost),
+    copyMaxBudget: parseNum(env.COPY_MAX_BUDGET, defaultConfig.copyMaxBudget),
+    copyMaxAgeSeconds: parseNum(env.COPY_MAX_AGE_SECONDS, defaultConfig.copyMaxAgeSeconds),
   };
 }
 

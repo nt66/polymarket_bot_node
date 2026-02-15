@@ -15,13 +15,15 @@ export async function executeSignal(
   client: PolymarketClient | null,
   signal: ArbSignal,
   tickSize: string,
-  negRisk: boolean
+  negRisk: boolean,
+  orderType?: "GTC" | "FOK"
 ): Promise<ExecutionResult> {
   if (!client) {
     return { ok: false, orderIds: [], error: "No Polymarket client" };
   }
 
   const options = { tickSize, negRisk };
+  const ot = orderType ?? "GTC";
 
   const toResult = (res: { success: boolean; orderId?: string; errorMsg?: string }): ExecutionResult => ({
     ok: res.success === true,  // 严格判断
@@ -33,7 +35,7 @@ export async function executeSignal(
     const res = await client.createAndPostOrder(
       { tokenID: signal.tokenId, price: signal.price, size: signal.size, side: "BUY" },
       options,
-      "GTC"
+      ot
     );
     return toResult(res);
   }
@@ -43,12 +45,12 @@ export async function executeSignal(
       client.createAndPostOrder(
         { tokenID: signal.yesTokenId, price: signal.askYes, size: signal.size, side: "BUY" },
         options,
-        "GTC"
+        ot
       ),
       client.createAndPostOrder(
         { tokenID: signal.noTokenId, price: signal.askNo, size: signal.size, side: "BUY" },
         options,
-        "GTC"
+        ot
       ),
     ]);
     const orderIds: string[] = [];
@@ -66,7 +68,7 @@ export async function executeSignal(
     const res = await client.createAndPostOrder(
       { tokenID: signal.tokenId, price: signal.price, size: signal.size, side: signal.side },
       options,
-      "GTC"
+      ot
     );
     return toResult(res);
   }
@@ -75,7 +77,7 @@ export async function executeSignal(
     const res = await client.createAndPostOrder(
       { tokenID: signal.tokenId, price: signal.price, size: signal.size, side: "SELL" },
       options,
-      "GTC"
+      ot
     );
     return toResult(res);
   }

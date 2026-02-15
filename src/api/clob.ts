@@ -184,6 +184,24 @@ export async function createPolymarketClient(config: EnvConfig): Promise<Polymar
     async syncTokenBalance(tokenId: string): Promise<boolean> {
       try {
         lastClobError = "";
+        // 先获取当前余额
+        let balResult: any;
+        await interceptClobError(async () => {
+          balResult = await tradingClient.getBalanceAllowance({
+            asset_type: "CONDITIONAL" as any,
+            token_id: tokenId,
+          });
+        });
+        const currentBal = parseFloat(balResult?.balance ?? "0");
+        const currentAllowance = parseFloat(balResult?.allowance ?? "0");
+        console.log(`[Sync] token 当前: balance=${currentBal}, allowance=${currentAllowance}`);
+
+        // 如果余额 > 0 但授权不足，需要更新授权
+        if (currentBal > 0 && currentAllowance < currentBal) {
+          console.log(`[Sync] 授权不足，开始更新...`);
+        }
+
+        lastClobError = "";
         await interceptClobError(() =>
           tradingClient.updateBalanceAllowance({ asset_type: "CONDITIONAL" as any, token_id: tokenId })
         );
@@ -191,6 +209,7 @@ export async function createPolymarketClient(config: EnvConfig): Promise<Polymar
           console.log(`[Sync] token 授权失败: ${lastClobError}`);
           return false;
         }
+        console.log(`[Sync] token 授权完成`);
         return true;
       } catch (e) {
         console.log(`[Sync] token 授权异常: ${e instanceof Error ? e.message : e}`);
@@ -220,7 +239,10 @@ export async function createPolymarketClient(config: EnvConfig): Promise<Polymar
     async createAndPostOrder(params, options, orderType) {
       try {
         const { OrderType, Side } = await import("@polymarket/clob-client");
-        const orderTypeEnum = orderType === "GTD" ? OrderType.GTD : OrderType.GTC;
+        // FOK 在运行时支持但 TS 类型定义未包含，用 as any 绕过
+        const orderTypeEnum = orderType === "FOK" ? (OrderType.FOK as any)
+          : orderType === "GTD" ? OrderType.GTD
+          : OrderType.GTC;
         const result = await tradingClient.createAndPostOrder(
           {
             tokenID: params.tokenID,
