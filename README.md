@@ -48,6 +48,49 @@ npm run stop     # 请求停止（下次轮询时退出）
 npm run dev      # 开发模式（tsx 直接跑 src）
 ```
 
+## 远程部署：停止服务与查看输出
+
+部署到远程机器后，若用 SSH 直接跑 `npm run start`，断开连接后进程会退出，且不方便随时看日志。推荐用 **PM2** 管理进程，既能后台常驻，又能随时停止、查看终端输出。
+
+### 1. 安装 PM2（远程机上一次即可）
+
+```bash
+npm install -g pm2
+```
+
+### 2. 启动服务（在项目根目录执行）
+
+```bash
+cd /path/to/polymarket_bot_node
+npm run build
+mkdir -p logs
+pm2 start ecosystem.config.cjs
+```
+
+### 3. 停止服务
+
+任选其一即可：
+
+- **推荐**：`pm2 stop polymarket-bot` — 停止进程（可随时 `pm2 start polymarket-bot` 再启）
+- 或在同一项目目录下执行 `npm run stop` — 写入停止标记，bot 下次轮询时自己退出（优雅退出）
+- 或 `pm2 delete polymarket-bot` — 从 PM2 列表移除（需再启动时用 `pm2 start ecosystem.config.cjs`）
+
+### 4. 查看终端输出
+
+- **实时看日志（类似 terminal 输出）**：`pm2 logs polymarket-bot`
+- 只看最近 200 行：`pm2 logs polymarket-bot --lines 200`
+- 查看状态：`pm2 status`
+- 日志也写在 `./logs/out.log` 和 `./logs/err.log`，可直接 `tail -f logs/out.log`
+
+### 5. 其他常用命令
+
+```bash
+pm2 restart polymarket-bot   # 重启
+pm2 flush polymarket-bot     # 清空当前日志缓冲
+```
+
+若不想用 PM2，也可用 **screen** / **tmux**：在 session 里运行 `npm run start`，需要看输出时 SSH 上去执行 `screen -r` 或 `tmux attach` 即可；停止时在同一 session 里 Ctrl+C，或另开终端到项目目录执行 `npm run stop`。
+
 ## 依赖
 
 - Node.js >= 18

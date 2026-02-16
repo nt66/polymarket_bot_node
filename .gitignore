@@ -3,4 +3,5 @@ dist/
 .env
 .polymarket-bot-stop
 *.log
+logs/
 .DS_Store
