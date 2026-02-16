@@ -617,6 +617,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
                   console.log(`[TREND] 买入成功:`, r.orderIds);
                   tracker.recordBuy(tokenId, dir as "up" | "down", askPrice, size, slug);
                   cachedUsdcBalance -= cost; // 更新本地余额缓存
+                  await refreshUsdcBalance(); // 买入后强制刷新余额
                   // 买入后 sync token 授权（重试 3 次）
                   for (let si = 0; si < 3; si++) {
                     const ok = await client.syncTokenBalance(tokenId);
@@ -672,6 +673,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
                   console.log(`[ENDGAME] 买入成功:`, r.orderIds, `→ 等结算 (~${Math.round(secsLeft)}s)`);
                   tracker.recordBuy(tokenId, dir as "up" | "down", askPrice, size, slug);
                   cachedUsdcBalance -= cost; // 更新本地余额缓存
+                  await refreshUsdcBalance(); // 买入后强制刷新余额
                   for (let si = 0; si < 3; si++) {
                     const ok = await client.syncTokenBalance(tokenId);
                     if (ok) break;
@@ -724,6 +726,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
               console.log("[ENTER] NegRisk 成功:", r.orderIds);
               tracker.recordBuy(negSignal.yesTokenId, "up", negSignal.askYes, negSignal.size, slug);
               tracker.recordBuy(negSignal.noTokenId, "down", negSignal.askNo, negSignal.size, slug);
+              await refreshUsdcBalance(); // NegRisk 买入后强制刷新余额
             }
           }
         }

@@ -45,7 +45,7 @@ export async function runCopy(options: CopyRunnerOptions = {}): Promise<void> {
   const MAX_PENDING_COST = Math.min(config.copyMaxPendingCost, config.copyMaxBudget);
   const MAX_BUDGET = config.copyMaxBudget;       // 总预算，仓位+可用不超过此
   const MAX_AGE_SECONDS = config.copyMaxAgeSeconds; // Data API 有延迟，放宽到 300s
-  const MIN_COPY_SHARES = 5;                     // 最少 5 股（平台常见最小下单量）
+  const MIN_COPY_SHARES = 2;                     // 最少 1 股，平台允许最小1股
   const FETCH_TRADES_LIMIT = 50;                 // 每轮多拉一些，减少漏单
 
   if (!TARGET_ADDRESS) {
@@ -89,7 +89,7 @@ export async function runCopy(options: CopyRunnerOptions = {}): Promise<void> {
 
   // 首次拉取 — 标记已有交易为"已处理"，不回溯跟单
   console.log("[Init] 加载目标用户历史交易...");
-  const initialTrades = await fetchTargetTrades(TARGET_ADDRESS, 100);
+  const initialTrades = await fetchTargetTrades(TARGET_ADDRESS, 50);
   for (const t of initialTrades) {
     processedTxHashes.add(t.transactionHash);
   }
@@ -102,6 +102,19 @@ export async function runCopy(options: CopyRunnerOptions = {}): Promise<void> {
 
   // === 主循环 ===
   const runOnce = async (): Promise<void> => {
+    // === 自动清理已结算/无余额持仓，释放预算 ===
+    for (const [tokenId, pos] of copiedPositions.entries()) {
+      try {
+        const bal = await client.getTokenBalance(tokenId);
+        if (!bal || bal < 0.0001) {
+          totalPendingCost -= pos.price * pos.size;
+          copiedPositions.delete(tokenId);
+          console.log(`[Clean] 已结算/无余额，释放持仓: ${tokenId} x${pos.size} $${(pos.price * pos.size).toFixed(2)}`);
+        }
+      } catch (e) {
+        // 忽略单个异常
+      }
+    }
     if (isStopRequested()) {
       console.log("Stop requested. Exiting.");
       process.exit(0);
@@ -127,8 +140,14 @@ export async function runCopy(options: CopyRunnerOptions = {}): Promise<void> {
       return;
     }
 
-    // 筛选新交易
-    const newTrades = trades.filter((t) => !processedTxHashes.has(t.transactionHash));
+
+    // 筛选新交易，并只保留BTC 15min/5min盘口
+    const newTrades = trades.filter((t) => {
+      if (processedTxHashes.has(t.transactionHash)) return false;
+      // 只跟btc-updown-15m和btc-updown-5m盘口
+      if (!t.slug?.includes("btc-updown-15m") && !t.slug?.includes("btc-updown-5m")) return false;
+      return true;
+    });
     if (newTrades.length === 0) return;
 
     // 按时间排序（旧 → 新）
@@ -183,8 +202,13 @@ export async function runCopy(options: CopyRunnerOptions = {}): Promise<void> {
         }
 
         const sizeNote = copySize < COPY_SIZE_MAX ? ` (预算换算 ${copySize} 股)` : "";
-        console.log(`[COPY BUY] ${tradeInfo}`);
-        console.log(`  → 跟单: @${trade.price.toFixed(2)} x${copySize} = $${cost.toFixed(2)}${sizeNote}`);
+        if (copySize === 1) {
+          console.log(`[COPY BUY] ${tradeInfo}`);
+          console.log(`  → 跟单: @${trade.price.toFixed(2)} x1 = $${cost.toFixed(2)} (预算仅够1股)`);
+        } else {
+          console.log(`[COPY BUY] ${tradeInfo}`);
+          console.log(`  → 跟单: @${trade.price.toFixed(2)} x${copySize} = $${cost.toFixed(2)}${sizeNote}`);
+        }
 
         try {
           // 先获取订单簿确认价格合理
