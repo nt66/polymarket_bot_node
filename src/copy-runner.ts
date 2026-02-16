@@ -21,6 +21,17 @@ import { executeSignal } from "./execution/executor.js";
 import { loadConfig } from "./config/index.js";
 
 const STOP_FILE = path.join(process.cwd(), ".polymarket-bot-stop");
+const LOG_DIR = path.join(process.cwd(), "logs");
+const LOG_FILE = path.join(LOG_DIR, "copy-trade.log");
+
+function logToFile(msg: string) {
+  try {
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR);
+    fs.appendFileSync(LOG_FILE, msg + "\n");
+  } catch (e) {
+    // 忽略日志写入异常
+  }
+}
 
 function isStopRequested(): boolean {
   try { return fs.existsSync(STOP_FILE); } catch { return false; }
@@ -142,22 +153,21 @@ export async function runCopy(options: CopyRunnerOptions = {}): Promise<void> {
 
 
     // 筛选新交易，并只保留BTC 15min/5min盘口
-    const newTrades = trades.filter((t) => {
-      if (processedTxHashes.has(t.transactionHash)) return false;
-      // 只跟btc-updown-15m和btc-updown-5m盘口
-      if (!t.slug?.includes("btc-updown-15m") && !t.slug?.includes("btc-updown-5m")) return false;
-      return true;
-    });
+    const newTrades = trades.filter((t) => !processedTxHashes.has(t.transactionHash));
     if (newTrades.length === 0) return;
 
     // 按时间排序（旧 → 新）
     newTrades.sort((a, b) => a.timestamp - b.timestamp);
 
     for (const trade of newTrades) {
+            // ...完全跟单逻辑，无特殊自动平仓处理...
       processedTxHashes.add(trade.transactionHash);
 
       const ageSeconds = Math.round(Date.now() / 1000 - trade.timestamp);
       const tradeInfo = `${trade.side} ${trade.outcome} @${trade.price.toFixed(2)} x${trade.size.toFixed(1)} | ${trade.slug?.slice(0, 35)} (${ageSeconds}s ago)`;
+
+      // 记录大佬交易日志
+      logToFile(`[LEADER] ${new Date(trade.timestamp * 1000).toISOString()} | ${tradeInfo} | tx: ${trade.transactionHash}`);
 
       // === 过滤条件 ===
       // 1. 太老的交易不跟（Data API 常有 1～3 分钟延迟，用 COPY_MAX_AGE_SECONDS 放宽）
@@ -240,6 +250,8 @@ export async function runCopy(options: CopyRunnerOptions = {}): Promise<void> {
           };
 
           const r = await executeSignal(client, signal, tickSize, negRisk);
+          // 记录自己下单日志
+          logToFile(`[BOT BUY] ${new Date().toISOString()} | ${tradeInfo} | price: ${buyPrice} x${copySize} | cost: $${cost.toFixed(2)} | result: ${r.ok ? "OK" : r.error}`);
           if (r.ok) {
             console.log(`  ✅ 买入成功:`, r.orderIds);
             usdcBalance -= cost;
@@ -308,6 +320,8 @@ export async function runCopy(options: CopyRunnerOptions = {}): Promise<void> {
           };
 
           const r = await executeSignal(client, signal, tickSize, negRisk);
+          // 记录自己卖出日志
+          logToFile(`[BOT SELL] ${new Date().toISOString()} | ${tradeInfo} | price: ${sellPrice} x${pos.size} | result: ${r.ok ? "OK" : r.error}`);
           if (r.ok) {
             console.log(`  ✅ 卖出成功:`, r.orderIds);
             usdcBalance += sellPrice * pos.size;
