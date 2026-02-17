@@ -22,7 +22,7 @@ export function requestStop(): void {
   try { fs.writeFileSync(STOP_FILE, String(Date.now()), "utf8"); } catch (e) { console.error("stop err:", e); }
 }
 function clearStopFile(): void {
-  try { if (fs.existsSync(STOP_FILE)) fs.unlinkSync(STOP_FILE); } catch {}
+  try { if (fs.existsSync(STOP_FILE)) fs.unlinkSync(STOP_FILE); } catch { }
 }
 
 function findYesToken(market: GammaMarket) {
@@ -98,7 +98,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   try {
     const bal = await client.getBalance();
     console.log(`[Init] USDC 余额: $${bal.balance} | 授权: $${bal.allowance}`);
-  } catch {}
+  } catch { }
   console.log("---");
 
   let marketResult: Btc15mResult = { allMarkets: [], inWindow: [], upcoming: [], nextStartsInSec: -1 };
@@ -115,7 +115,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   // 98 策略：只止盈卖出，不主动止损（止损关掉，避免亏着卖）
   const tracker = new PositionTracker({
     profitTarget: 0.01,
-    stopLoss: 0.10, // 止损 跌了0.80C
+    stopLoss: 0.80, // 止损 跌了0.80C
     maxHoldMs: 280_000,
     maxPositionPerMarket: 50,
     maxTradesPerWindow: 10,
