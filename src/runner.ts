@@ -12,6 +12,7 @@ import type { MarketContext } from "./strategies/types.js";
 import { executeSignal } from "./execution/executor.js";
 import { loadConfig } from "./config/index.js";
 import { PositionTracker } from "./risk/position-tracker.js";
+import { logTrade, logRoundEnd } from "./util/daily-log.js";
 
 const STOP_FILE = path.join(process.cwd(), ".polymarket-bot-stop");
 
@@ -104,6 +105,9 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   let marketResult: Btc15mResult = { allMarkets: [], inWindow: [], upcoming: [], nextStartsInSec: -1 };
 
   // 98/99 策略：不做止损冷却，否则会大量错过入场窗口
+
+  // 每轮结束时的盘口快照，用于按天日志 ROUND_END（slug -> 最后一笔 Up/Down 价格）
+  const lastSnapshotBySlug = new Map<string, { upBid: number; upAsk: number; downBid: number; downAsk: number; endTime: string }>();
 
   // === 未成交挂单：本轮挂着，下一轮 5min 再取消（支持同轮 0.98 + 0.99 两档同时挂）===
   // key: `${slug}:${side}:${price}`
@@ -259,8 +263,24 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     const activeSlugs = new Set(activeMarkets.map((m) => m.slug || "").filter(Boolean));
     tracker.cleanupExpiredMarkets(activeSlugs);
 
+    const roundEndLogged = new Set<string>();
     for (const [k, p] of pendingByKey.entries()) {
       if (!activeSlugs.has(p.slug)) {
+        if (!roundEndLogged.has(p.slug)) {
+          const snap = lastSnapshotBySlug.get(p.slug);
+          if (snap) {
+            logRoundEnd({
+              slug: p.slug,
+              endTime: new Date().toISOString(),
+              upBid: snap.upBid,
+              upAsk: snap.upAsk,
+              downBid: snap.downBid,
+              downAsk: snap.downAsk,
+            });
+            lastSnapshotBySlug.delete(p.slug);
+          }
+          roundEndLogged.add(p.slug);
+        }
         await client.cancelOrder(p.orderId);
         pendingByKey.delete(k);
         console.log(`[98C] 轮结束，取消挂单 ${p.side.toUpperCase()} @${p.price} ${p.slug.slice(0, 20)}…`);
@@ -312,6 +332,11 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
         console.log(`[EXIT] ${sig.reason}`);
 
+        if (pos) {
+          const shortReason = sig.reason.includes("止盈") ? "止盈" : sig.reason.includes("止损") ? "止损" : "EXIT";
+          logTrade({ slug: pos.marketSlug, side: pos.side, action: "SELL", price: sig.price, size: sig.size, reason: shortReason });
+        }
+
         // 使用增强版卖出函数（检查余额 + sync + 重试）
         const sold = await attemptSell(sig.tokenId, sig, ctx);
         if (sold) {
@@ -327,12 +352,14 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
       const endMs = market.endDate ? new Date(market.endDate).getTime() : 0;
       const secsLeft = (endMs - nowMs) / 1000;
-      if (secsLeft <= 15) continue;
 
       const upBid = ctx.yesBook?.bids?.[0] ? parseFloat(ctx.yesBook.bids[0].price) : 0;
       const downBid = ctx.noBook?.bids?.[0] ? parseFloat(ctx.noBook.bids[0].price) : 0;
       const upAsk = ctx.yesBook?.asks?.[0] ? parseFloat(ctx.yesBook.asks[0].price) : 1;
       const downAsk = ctx.noBook?.asks?.[0] ? parseFloat(ctx.noBook.asks[0].price) : 1;
+      lastSnapshotBySlug.set(slug, { upBid, upAsk, downBid, downAsk, endTime: market.endDate || "" });
+
+      if (secsLeft <= 15) continue;
 
       // ========== 98/99C 挂单（价从 .env）、单子挂到下轮再撤、盈利即卖 ==========
       // 只做 98/99 两档，97 不买
@@ -375,6 +402,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         }
 
         tracker.recordBuy(p.tokenId, p.side, p.price, buySize, slug);
+        logTrade({ slug, side: p.side, action: "BUY", price: p.price, size: buySize });
         console.log(`[98C] ${p.side.toUpperCase()} 成交 ${fullyFilled ? "✓" : "(部分)"} @${p.price} x${buySize}`);
         for (let si = 0; si < 3; si++) {
           const ok = await client.syncTokenBalance(p.tokenId);
