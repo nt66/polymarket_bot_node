@@ -335,7 +335,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       const downAsk = ctx.noBook?.asks?.[0] ? parseFloat(ctx.noBook.asks[0].price) : 1;
 
       // ========== 98/99C 挂单（价从 .env）、单子挂到下轮再撤、盈利即卖 ==========
-      const orderPrices = config.buy98OrderPrices;
+      // 只做 98/99 两档，97 不买
+      const orderPrices = config.buy98OrderPrices.filter((p) => p >= 0.98);
       const orderShares = Math.max(5, Math.floor(config.buy98OrderSizeShares));
       const tickSize = parseFloat(ctx.tickSize || "0.01");
       const roundToTick = (n: number) => Number((Math.floor(n / tickSize) * tickSize).toFixed(4));
@@ -347,7 +348,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           if (pr >= 0.99) {
             if (inBand(ask, 0.985, 0.9999) || inBand(bid, 0.985, 0.9999)) return pr;
           } else {
-            if (inBand(ask, 0.975, 0.984) || inBand(bid, 0.975, 0.984)) return pr;
+            if (inBand(ask, 0.978, 0.984) || inBand(bid, 0.975, 0.984)) return pr;
           }
         }
         return null;
