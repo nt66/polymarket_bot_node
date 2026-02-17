@@ -112,11 +112,11 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     { orderId: string; tokenId: string; side: "up" | "down"; size: number; price: number; slug: string; placedAt: number; marketEndMs: number }
   >();
 
-  // 98 策略：只止盈卖出，不主动止损（止损关掉，避免亏着卖）
+  // 98 策略：只止盈卖出，不设价格/时间止损（跌了或拿久了都不主动卖，只等止盈或到期结算）
   const tracker = new PositionTracker({
     profitTarget: 0.01,
-    stopLoss: 0.80, // 止损 跌了0.80C
-    maxHoldMs: 280_000,
+    stopLoss: 999,   // 不止损
+    maxHoldMs: Number.MAX_SAFE_INTEGER, // 不时间止损，只靠止盈或市场到期
     maxPositionPerMarket: config.buy98OrderMaxPositionPerMarket,
     maxTradesPerWindow: 10,
   });
