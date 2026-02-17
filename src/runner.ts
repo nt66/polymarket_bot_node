@@ -415,6 +415,10 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
       if (tracker.hasOpenPosition()) continue;
 
+      // 每次只做一单：该市场已有任意挂单则不再挂
+      const hasPendingForSlug = Array.from(pendingByKey.keys()).some((k) => k.startsWith(`${slug}:`));
+      if (hasPendingForSlug) continue;
+
       const size = orderShares;
       const upPr = pickPrice(upAsk, upBid);
       const downPr = pickPrice(downAsk, downBid);
