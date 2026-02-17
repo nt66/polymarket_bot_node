@@ -115,7 +115,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   // 98 策略：只止盈卖出，不主动止损（止损关掉，避免亏着卖）
   const tracker = new PositionTracker({
     profitTarget: 0.01,
-    stopLoss: 0.80, // 止损 跌了0.80C
+    stopLoss: 0.10, // 止损 跌了0.80C
     maxHoldMs: 280_000,
     maxPositionPerMarket: 50,
     maxTradesPerWindow: 10,
