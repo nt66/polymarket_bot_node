@@ -15,8 +15,10 @@ if (cmd === "stop") {
 
 if (cmd === "start") {
   run({
-    pollIntervalMs: 2000,
-    marketRefreshMs: 60000,
+    // BTC 5min + 98C 这种盘口变化很快：2s 轮询很容易错过瞬间的 0.98
+    pollIntervalMs: 250,
+    // 5min 轮次切换也更频繁，刷新市场列表加快一点
+    marketRefreshMs: 1000,
   }).catch((e) => {
     console.error("Runner error:", e);
     process.exit(1);

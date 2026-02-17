@@ -239,3 +239,59 @@ export async function getBtc5MinMarkets(): Promise<Btc15mResult> {
 
   return { allMarkets, inWindow, upcoming, nextStartsInSec };
 }
+
+/**
+ * 获取 BTC 5min 市场（轻量版）。
+ * 只拉当前/上一/下一轮 3 个 slug，避免高频轮询时一次打太多请求导致变慢、错过窗口。
+ */
+export async function getBtc5MinMarketsFast(): Promise<Btc15mResult> {
+  const nowSec = Date.now() / 1000;
+  const currentSlotStart = Math.floor(nowSec / FIVE_MIN_SEC) * FIVE_MIN_SEC;
+  const prevSlot = currentSlotStart - FIVE_MIN_SEC;
+  const nextSlot = currentSlotStart + FIVE_MIN_SEC;
+  const slots = [prevSlot, currentSlotStart, nextSlot];
+  const slugs = slots.map((ts) => `btc-updown-5m-${ts}`);
+
+  const results = await Promise.allSettled(slugs.map((slug) => getEventBySlug(slug)));
+
+  const allMarkets: GammaMarket[] = [];
+  const inWindow: GammaMarket[] = [];
+  const upcoming: GammaMarket[] = [];
+
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.status !== "fulfilled" || !r.value) continue;
+    const event = r.value;
+    if (event.closed) continue;
+    if (!event.markets?.length) continue;
+
+    for (const m of event.markets) {
+      if ((m as GammaMarket).closed) continue;
+      const market = normalizeMarket(m as Record<string, unknown>);
+      if (market.tokens.length < 2) continue;
+
+      allMarkets.push(market);
+      const slotStart = slots[i];
+      const slotEnd = slotStart + FIVE_MIN_SEC;
+      if (nowSec >= slotStart && nowSec < slotEnd) {
+        inWindow.push(market);
+      } else if (nowSec < slotStart) {
+        upcoming.push(market);
+      }
+    }
+  }
+
+  upcoming.sort((a, b) => {
+    const ea = a.endDate ? new Date(a.endDate).getTime() : 0;
+    const eb = b.endDate ? new Date(b.endDate).getTime() : 0;
+    return ea - eb;
+  });
+
+  let nextStartsInSec = -1;
+  if (upcoming.length > 0) {
+    const nextEnd = upcoming[0].endDate ? new Date(upcoming[0].endDate).getTime() / 1000 : 0;
+    nextStartsInSec = Math.max(0, nextEnd - FIVE_MIN_SEC - nowSec);
+  }
+
+  return { allMarkets, inWindow, upcoming, nextStartsInSec };
+}

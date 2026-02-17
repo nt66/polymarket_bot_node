@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { ClobClient, AssetType, OrderType, Side } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
-import { getBtc15MinMarkets } from "./api/gamma.js";
+import { getBtc5MinMarkets } from "./api/gamma.js";
 import { loadConfig } from "./config/index.js";
 
 async function main() {
@@ -17,7 +17,7 @@ async function main() {
   );
 
   // 1. 拿到市场
-  const result = await getBtc15MinMarkets(config.btc15MinTagId || undefined, config.btc15MinSlug || undefined);
+  const result = await getBtc5MinMarkets();
   const markets = result.inWindow.length > 0 ? result.inWindow : result.allMarkets;
   if (!markets.length) { console.log("无市场"); return; }
   const m = markets[0];

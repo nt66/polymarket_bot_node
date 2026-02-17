@@ -86,6 +86,12 @@ export interface PolymarketClient {
   /** 取消所有挂单 */
   cancelAll(): Promise<void>;
 
+  /** 取消指定挂单（用于 98C 买不进则撤） */
+  cancelOrder(orderId: string): Promise<boolean>;
+
+  /** 查询订单状态（用于 98C 判断是否成交） */
+  getOrder(orderId: string): Promise<{ status?: string; size_matched?: number; original_size?: number } | null>;
+
   /** 获取 USDC 余额 */
   getBalance(): Promise<{ balance: string; allowance: string }>;
 
@@ -169,6 +175,30 @@ export async function createPolymarketClient(config: EnvConfig): Promise<Polymar
         console.log("[Orders] 所有挂单已取消");
       } catch (e) {
         console.log("[Orders] cancelAll:", e instanceof Error ? e.message : e);
+      }
+    },
+
+    async cancelOrder(orderId: string): Promise<boolean> {
+      try {
+        await (tradingClient as any).cancelOrder({ orderID: orderId });
+        return true;
+      } catch (e) {
+        console.log("[Orders] cancelOrder:", e instanceof Error ? e.message : e);
+        return false;
+      }
+    },
+
+    async getOrder(orderId: string): Promise<{ status?: string; size_matched?: number; original_size?: number } | null> {
+      try {
+        const o = await (tradingClient as any).getOrder(orderId);
+        if (!o) return null;
+        return {
+          status: o.status,
+          size_matched: o.size_matched != null ? parseFloat(String(o.size_matched)) : undefined,
+          original_size: o.original_size != null ? parseFloat(String(o.original_size)) : undefined,
+        };
+      } catch {
+        return null;
       }
     },
 

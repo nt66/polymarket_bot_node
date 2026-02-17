@@ -1,25 +1,14 @@
 /**
- * 主运行器 v4：强化版 Scalp 模式
- *
- * v3 → v4 改进（基于交易复盘）：
- * 1. 卖出前检查实际代币余额（getTokenBalance），避免 "not enough balance"
- * 2. 最小持仓时间从 10s → 30s，给 Polymarket 后端足够时间结算代币
- * 3. BTC 震荡检测：如果 BTC 60秒内波幅 > $80 但方向不明，不入场
- * 4. 要求 BTC 偏离起点 > $40 才允许 TREND 入场
- * 5. 止损后 90 秒冷却期，不在同一市场立即重入
- * 6. 止损收紧到 $0.08/share（从 $0.10），止盈保持 $0.07/share
- * 7. TREND_MIN_BID 默认提高到 0.70（少而准）
+ * 98 概率买入、盈利及时卖出（仅 BTC 5min）
+ * 挂单价从 .env 的 BUY98_ORDER_PRICE 读取。
  */
 
 import * as fs from "fs";
 import * as path from "path";
-import { getBtc15MinMarkets, getBtc5MinMarkets } from "./api/gamma.js";
+import { getBtc5MinMarketsFast } from "./api/gamma.js";
 import { getOrderBooks, createPolymarketClient } from "./api/clob.js";
-import { connectOkxBtcSpot, closeOkxWs, fetchBtcPriceHttp } from "./api/okx-ws.js";
-import type WebSocket from "ws";
 import type { GammaMarket, Btc15mResult } from "./api/gamma.js";
 import type { MarketContext } from "./strategies/types.js";
-import { checkNegRiskArb } from "./strategies/neg-risk-arb.js";
 import { executeSignal } from "./execution/executor.js";
 import { loadConfig } from "./config/index.js";
 import { PositionTracker } from "./risk/position-tracker.js";
@@ -70,19 +59,16 @@ export interface RunnerOptions {
 
 export async function run(options: RunnerOptions = {}): Promise<void> {
   const config = loadConfig();
-  const FAST_POLL_MS = options.pollIntervalMs ?? 2000;
-  const IDLE_POLL_MS = 30000;
+  // 盘口在 5min 末期可能“闪现”0.98，轮询过慢会错过
+  const FAST_POLL_MS = options.pollIntervalMs ?? 250;
+  // 即使“当前无 inWindow 市场”，也要高频刷新以免错过开盘瞬间
+  const IDLE_POLL_MS = FAST_POLL_MS;
   const marketRefreshMs = options.marketRefreshMs ?? 30000;
 
-  // ============ 核心参数 ============
-  const PROFIT_TARGET = 0.07;      // 止盈 +$0.07/share
-  const STOP_LOSS = 0.08;          // 止损 -$0.08/share（收紧，减少损失）
-  const MAX_HOLD_MS = 120_000;     // 最长持有 120 秒
-  const MIN_HOLD_BEFORE_SELL_MS = 30_000;  // 卖出前至少持有 30 秒（代币结算时间）
-  const MIN_BTC_DEVIATION = 40;    // BTC 至少偏离起点 $40 才入场
-  const LOSS_COOLDOWN_MS = 90_000; // 止损后 90 秒冷却期
-  const CHOPPY_THRESHOLD = 80;     // BTC 60秒内波幅 > $80 视为震荡
-  // ==================================
+  // 98 策略要求「有盈利立刻卖出」：不做最小持仓时间限制
+  // 代币未结算的情况由 attemptSell 内部的余额检查 + sync + 等待兜底
+  const MIN_HOLD_BEFORE_SELL_MS = 0;
+  const LOSS_COOLDOWN_MS = 90_000;         // 止损后冷却期
 
   if (!config.privateKey || !config.funderAddress) {
     console.error("Missing PRIVATE_KEY or POLYMARKET_FUNDER_ADDRESS.");
@@ -96,8 +82,9 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   }
 
   clearStopFile();
-  console.log("=== Polymarket Scalp Bot v4 ===");
-  console.log(`止盈+$${PROFIT_TARGET} | 止损-$${STOP_LOSS} | 持有30-${MAX_HOLD_MS / 1000}s | BTC偏离>$${MIN_BTC_DEVIATION} | 止损冷却${LOSS_COOLDOWN_MS / 1000}s`);
+
+  console.log("=== 98概率买入 盈利及时卖出 (仅 BTC 5min) ===");
+  console.log(`挂单价=${config.buy98OrderPrices.join(",")} | 每次 ${config.buy98OrderSizeShares} shares | 盈利即卖`);
   console.log("---");
 
   // === 初始化授权（USDC + Outcome tokens） ===
@@ -115,32 +102,28 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   console.log("---");
 
   let marketResult: Btc15mResult = { allMarkets: [], inWindow: [], upcoming: [], nextStartsInSec: -1 };
-  let lastBtcPrice = 0;
-  let okxWs: WebSocket | null = null;
-  const marketStartPrices = new Map<string, number>();
 
-  // === BTC 价格历史（用于震荡检测）===
-  const btcPriceHistory: Array<{ price: number; ts: number }> = [];
-  const BTC_HISTORY_WINDOW_MS = 60_000; // 60 秒窗口
+  // 98/99 策略：不做止损冷却，否则会大量错过入场窗口
 
-  // === 止损冷却追踪 ===
-  const lossCooldownUntil = new Map<string, number>(); // market slug → cooldown expires timestamp
+  // === 未成交挂单：本轮挂着，下一轮 5min 再取消（支持同轮 0.98 + 0.99 两档同时挂）===
+  // key: `${slug}:${side}:${price}`
+  const pendingByKey = new Map<
+    string,
+    { orderId: string; tokenId: string; side: "up" | "down"; size: number; price: number; slug: string; placedAt: number; marketEndMs: number }
+  >();
 
-  // === Scalp 风控 ===
+  // 98 策略：只止盈卖出，不主动止损（止损关掉，避免亏着卖）
   const tracker = new PositionTracker({
-    profitTarget: PROFIT_TARGET,
-    stopLoss: STOP_LOSS,
-    maxHoldMs: MAX_HOLD_MS,
-    maxPositionPerMarket: config.maxPositionPerMarket,
-    maxTradesPerWindow: config.maxTradesPerWindow,
+    profitTarget: 0.01,
+    stopLoss: 0.80, // 止损 跌了0.80C
+    maxHoldMs: 280_000,
+    maxPositionPerMarket: 50,
+    maxTradesPerWindow: 10,
   });
 
-  // === 市场刷新 ===
   async function refreshMarkets(): Promise<void> {
     try {
-      const result = config.btcMarketMode === "5m"
-        ? await getBtc5MinMarkets()
-        : await getBtc15MinMarkets(config.btc15MinTagId || undefined, config.btc15MinSlug || undefined);
+      const result = await getBtc5MinMarketsFast();
       marketResult = result;
       if (result.inWindow.length > 0) {
         const info = result.inWindow.map((m) => {
@@ -158,77 +141,6 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   }
 
   await refreshMarkets();
-
-  // === BTC 震荡检测 ===
-  function isBtcChoppy(): boolean {
-    const now = Date.now();
-    const recent = btcPriceHistory.filter((p) => p.ts > now - BTC_HISTORY_WINDOW_MS);
-    if (recent.length < 5) return false;
-    const prices = recent.map((p) => p.price);
-    const range = Math.max(...prices) - Math.min(...prices);
-    if (range < CHOPPY_THRESHOLD) return false;
-
-    // 判断是否有明确方向：如果最新价接近区间一端（>70%位置），认为有方向性
-    const min = Math.min(...prices);
-    const max = Math.max(...prices);
-    const latest = prices[prices.length - 1];
-    const position = (latest - min) / (max - min); // 0=最低 1=最高
-    const hasDirection = position > 0.75 || position < 0.25;
-
-    if (!hasDirection) {
-      return true; // 震荡：大波幅但无方向
-    }
-    return false;
-  }
-
-  function recordBtcPrice(price: number): void {
-    const now = Date.now();
-    btcPriceHistory.push({ price, ts: now });
-    // 清理超过 120 秒的老数据
-    while (btcPriceHistory.length > 0 && btcPriceHistory[0].ts < now - 120_000) {
-      btcPriceHistory.shift();
-    }
-  }
-
-  // === OKX WebSocket + 延迟套利入场信号 ===
-  let latencySignalDirection: "up" | "down" | null = null;
-  let latencySignalTime = 0;
-
-  if (config.strategyLatencyArb) {
-    const WINDOW_MS = 10_000;
-    const COOLDOWN_MS = 15_000;
-    const priceWindow: Array<{ price: number; ts: number }> = [];
-    let lastSignalMs = 0;
-
-    console.log(`[Latency] 10s 窗口 >= $${config.latencyMinJumpUsd} 触发，cooldown 15s`);
-
-    okxWs = connectOkxBtcSpot((price) => {
-      lastBtcPrice = price;
-      recordBtcPrice(price);
-      const now = Date.now();
-
-      priceWindow.push({ price, ts: now });
-      while (priceWindow.length > 0 && priceWindow[0].ts < now - WINDOW_MS) {
-        priceWindow.shift();
-      }
-      if (priceWindow.length < 3) return;
-
-      const prices = priceWindow.map((p) => p.price);
-      const range = Math.max(...prices) - Math.min(...prices);
-      if (range < config.latencyMinJumpUsd) return;
-      if (now - lastSignalMs < COOLDOWN_MS) return;
-      if (marketResult.inWindow.length === 0) return;
-
-      const activeKey = marketResult.inWindow[0]?.conditionId || marketResult.inWindow[0]?.slug || "";
-      const startPrice = marketStartPrices.get(activeKey);
-      const dir = startPrice ? (price > startPrice ? "up" : "down") : (price > priceWindow[0].price ? "up" : "down");
-
-      lastSignalMs = now;
-      latencySignalDirection = dir as "up" | "down";
-      latencySignalTime = now;
-      console.log(`[Latency] 信号: BTC 10s波幅$${range.toFixed(0)} → ${dir === "up" ? "↑Up" : "↓Down"}`);
-    });
-  }
 
   let lastMarketRefresh = Date.now();
   let lastStatusLog = 0;
@@ -257,7 +169,16 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         return false;
       }
     }
-    console.log(`[EXIT] 代币余额=${tokenBal}，开始卖出`);
+    // 注意：CLOB 返回的 balance 通常是 1e6 精度（例如 19998000 = 19.998 shares）
+    const availableShares = Math.max(0, tokenBal / 1_000_000);
+    const requested = sig.size;
+    const capped = Math.min(requested, availableShares);
+    const cappedRounded = Math.floor(capped * 100) / 100; // 向下取 0.01，避免“余额略小于 20”导致卖出失败
+    const finalSize = Math.max(0.01, cappedRounded);
+
+    console.log(
+      `[EXIT] 代币余额=${tokenBal} (~${availableShares.toFixed(3)} shares)，尝试卖出 size=${requested} -> ${finalSize}`
+    );
 
     // Step 2: sync token allowance
     await client!.syncTokenBalance(tokenId);
@@ -266,8 +187,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     // Step 3: 卖出，最多重试 3 次
     let sold = false;
     let sellPrice = sig.price;
-    const sellSizeRounded = Math.floor(sig.size * 100) / 100;
-    const sellSigBase = { ...sig, size: Math.max(0.01, sellSizeRounded) };
+    const sellSigBase = { ...sig, size: finalSize };
 
     for (let attempt = 0; attempt < 3 && !sold; attempt++) {
       try {
@@ -298,7 +218,6 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   // === 主循环 ===
   const runOnce = async (): Promise<void> => {
     if (isStopRequested()) {
-      if (okxWs) closeOkxWs(okxWs);
       console.log("Stop. Exiting.");
       process.exit(0);
     }
@@ -311,30 +230,18 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     const nowMs = Date.now();
     const activeMarkets = marketResult.inWindow;
 
-    // HTTP 备用 BTC 价格
-    if (lastBtcPrice <= 0) {
-      const p = await fetchBtcPriceHttp();
-      if (p) {
-        lastBtcPrice = p;
-        recordBtcPrice(p);
-        console.log(`[BTC] HTTP: $${p.toFixed(2)}`);
-      }
-    }
-
-    // 状态日志
+    // 状态日志（仅 Polymarket 盘口）
     if (nowMs - lastStatusLog >= STATUS_LOG_MS) {
       lastStatusLog = nowMs;
-      const btcStr = lastBtcPrice > 0 ? `$${lastBtcPrice.toFixed(0)}` : "—";
       const posStr = tracker.getSummary();
-      const choppyStr = isBtcChoppy() ? " ⚠CHOPPY" : "";
       if (activeMarkets.length > 0) {
         const info = activeMarkets.map((m) => {
           const endMs = m.endDate ? new Date(m.endDate).getTime() : 0;
           return `${m.slug?.slice(0, 28)}(${Math.round((endMs - nowMs) / 1000)}s)`;
         }).join(", ");
-        console.log(`[Tick] BTC ${btcStr}${choppyStr} | ${info}${posStr ? " | " + posStr : ""}`);
+        console.log(`[Tick] ${info}${posStr ? " | " + posStr : ""}`);
       } else {
-        console.log(`[Tick] BTC ${btcStr}${choppyStr} | idle${posStr ? " | " + posStr : ""}`);
+        console.log(`[Tick] idle${posStr ? " | " + posStr : ""}`);
       }
     }
 
@@ -352,6 +259,14 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     const activeSlugs = new Set(activeMarkets.map((m) => m.slug || "").filter(Boolean));
     tracker.cleanupExpiredMarkets(activeSlugs);
 
+    for (const [k, p] of pendingByKey.entries()) {
+      if (!activeSlugs.has(p.slug)) {
+        await client.cancelOrder(p.orderId);
+        pendingByKey.delete(k);
+        console.log(`[98C] 轮结束，取消挂单 ${p.side.toUpperCase()} @${p.price} ${p.slug.slice(0, 20)}…`);
+      }
+    }
+
     for (const market of activeMarkets) {
       const yesToken = findYesToken(market);
       const noToken = findNoToken(market);
@@ -363,13 +278,6 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         books.get(noToken.token_id) ?? null
       );
       const slug = market.slug || "";
-      const mKey = market.conditionId || slug || market.id;
-
-      // 记录起点价
-      if (!marketStartPrices.has(mKey) && lastBtcPrice > 0) {
-        marketStartPrices.set(mKey, lastBtcPrice);
-        console.log(`[Start] ${slug?.slice(0, 30)}: BTC $${lastBtcPrice.toFixed(0)}`);
-      }
 
       // 构建 bids map
       const currentBids = new Map<string, { price: number; size: number }>();
@@ -390,17 +298,6 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       const exitSignals = tracker.checkScalpExit(currentBids);
       for (const sig of exitSignals) {
         const pos = tracker.getPosition(sig.tokenId);
-        const endMsForCheck = market.endDate ? new Date(market.endDate).getTime() : 0;
-        const entrySecsBeforeEnd = (endMsForCheck - (pos?.entryTime || 0)) / 1000;
-        const isEndgamePos = pos && entrySecsBeforeEnd <= 130;
-
-        if (isEndgamePos) {
-          const holdSec = Math.round((nowMs - pos!.entryTime) / 1000);
-          if (nowMs - lastStatusLog < 200) {
-            console.log(`  [HOLD] ENDGAME 持仓 ${pos!.side.toUpperCase()} @${pos!.avgPrice} (${holdSec}s) → 等结算`);
-          }
-          continue;
-        }
 
         // === 最小持仓时间检查（30秒）===
         const holdMs = nowMs - (pos?.entryTime || 0);
@@ -419,200 +316,125 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         const sold = await attemptSell(sig.tokenId, sig, ctx);
         if (sold) {
           tracker.recordSell(sig.tokenId, sig.size);
-          // 如果是止损，设置冷却期
-          if (sig.reason.includes("止损")) {
-            lossCooldownUntil.set(slug, nowMs + LOSS_COOLDOWN_MS);
-            console.log(`[COOL] ${slug.slice(0, 20)} 止损冷却 ${LOSS_COOLDOWN_MS / 1000}s，不再入场`);
-          }
         } else {
           console.error("[EXIT] 3次卖出均失败，强制清仓标记");
           tracker.recordSell(sig.tokenId, sig.size);
-          // 卖出失败也设置冷却
-          lossCooldownUntil.set(slug, nowMs + LOSS_COOLDOWN_MS);
         }
       }
 
       // ========== 第二优先：如果有持仓，不开新单 ==========
       if (tracker.hasOpenPosition()) continue;
 
-      // ========== 第三优先：检查入场 ==========
       const endMs = market.endDate ? new Date(market.endDate).getTime() : 0;
       const secsLeft = (endMs - nowMs) / 1000;
-
-      // 不在最后 15 秒入场
       if (secsLeft <= 15) continue;
 
-      // 冷却期检查
-      const cooldownExpiry = lossCooldownUntil.get(slug);
-      if (cooldownExpiry && nowMs < cooldownExpiry) {
-        if (nowMs - lastStatusLog < 200) {
-          console.log(`  [COOL] 冷却中，还剩 ${Math.round((cooldownExpiry - nowMs) / 1000)}s`);
+      const upBid = ctx.yesBook?.bids?.[0] ? parseFloat(ctx.yesBook.bids[0].price) : 0;
+      const downBid = ctx.noBook?.bids?.[0] ? parseFloat(ctx.noBook.bids[0].price) : 0;
+      const upAsk = ctx.yesBook?.asks?.[0] ? parseFloat(ctx.yesBook.asks[0].price) : 1;
+      const downAsk = ctx.noBook?.asks?.[0] ? parseFloat(ctx.noBook.asks[0].price) : 1;
+
+      // ========== 98/99C 挂单（价从 .env）、单子挂到下轮再撤、盈利即卖 ==========
+      const orderPrices = config.buy98OrderPrices;
+      const orderShares = Math.max(5, Math.floor(config.buy98OrderSizeShares));
+      const tickSize = parseFloat(ctx.tickSize || "0.01");
+      const roundToTick = (n: number) => Number((Math.floor(n / tickSize) * tickSize).toFixed(4));
+      const roundSize = (s: number) => Math.max(0.01, roundToTick(s));
+      // 用“价格带”触发，避免浮点或四舍五入漏掉 98/99（两把都没触发多半是这里太严）
+      const inBand = (p: number, low: number, high: number) => Number.isFinite(p) && p >= low && p <= high;
+      const pickPrice = (ask: number, bid: number): number | null => {
+        for (const pr of orderPrices) {
+          if (pr >= 0.99) {
+            if (inBand(ask, 0.985, 0.9999) || inBand(bid, 0.985, 0.9999)) return pr;
+          } else {
+            if (inBand(ask, 0.975, 0.984) || inBand(bid, 0.975, 0.984)) return pr;
+          }
+        }
+        return null;
+      };
+
+      // 1) 已有该市场的 98C 挂单：检查是否成交，未成交且到点则撤单
+      // 1) 处理该市场所有未成交挂单：若任一档位成交到可卖(>=5)，记仓位并撤掉其它挂单
+      for (const [k, p] of pendingByKey.entries()) {
+        if (p.slug !== slug) continue;
+        const order = await client.getOrder(p.orderId);
+        const matched = order?.size_matched ?? 0;
+        const fullyFilled = matched >= p.size * 0.99;
+        const partiallyTradable = matched >= 5;
+        if (!partiallyTradable) continue;
+
+        const buySize = fullyFilled ? p.size : Math.floor(matched);
+        // 撤掉当前单剩余未成交（以及同轮其它档位挂单），避免重复买
+        await client.cancelOrder(p.orderId);
+        for (const [k2, p2] of pendingByKey.entries()) {
+          if (p2.slug === slug) {
+            if (k2 !== k) await client.cancelOrder(p2.orderId);
+            pendingByKey.delete(k2);
+          }
+        }
+
+        tracker.recordBuy(p.tokenId, p.side, p.price, buySize, slug);
+        console.log(`[98C] ${p.side.toUpperCase()} 成交 ${fullyFilled ? "✓" : "(部分)"} @${p.price} x${buySize}`);
+        for (let si = 0; si < 3; si++) {
+          const ok = await client.syncTokenBalance(p.tokenId);
+          if (ok) break;
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        // 已有仓位，本轮不再继续下单
+        break;
+      }
+
+      if (tracker.hasOpenPosition()) continue;
+
+      const size = orderShares;
+      const upPr = pickPrice(upAsk, upBid);
+      const downPr = pickPrice(downAsk, downBid);
+
+      // 每轮有盘口在 0.96+ 就打一行，方便看为什么没触发
+      if (upAsk >= 0.96 || upBid >= 0.96 || downAsk >= 0.96 || downBid >= 0.96) {
+        const u = upPr != null ? `Up→挂@${upPr}` : `Up 卖一=${upAsk.toFixed(2)} 买一=${upBid.toFixed(2)}`;
+        const d = downPr != null ? `Down→挂@${downPr}` : `Down 卖一=${downAsk.toFixed(2)} 买一=${downBid.toFixed(2)}`;
+        console.log(`[98C] ${u} | ${d}`);
+      }
+
+      // 98c 或 99c：满足价格带即挂单
+      if (upPr != null) {
+        const cost = upPr * size;
+        const key = `${slug}:up:${upPr}`;
+        if (pendingByKey.has(key)) continue;
+        if (cost < 1) continue;
+        if (!tracker.canBuy(slug, cost)) {
+          if (nowMs - lastStatusLog < 1000) console.log(`[98C] Up@${upPr} 跳过: canBuy=false (额度/笔数限制)`);
+          continue;
+        }
+        const signal = { type: "latency" as const, direction: "up" as const, tokenId: ctx.yesTokenId, price: upPr, size, reason: `98/99C Up 挂单` };
+        const r = await executeSignal(client, signal, ctx.tickSize, ctx.negRisk);
+        if (r.ok && r.orderIds[0]) {
+          pendingByKey.set(key, { orderId: r.orderIds[0], tokenId: ctx.yesTokenId, side: "up", size, price: upPr, slug, placedAt: nowMs, marketEndMs: endMs });
+          console.log(`[98C] Up 挂单成功 @${upPr} x${size} orderId=${r.orderIds[0].slice(0, 10)}…`);
+        } else {
+          console.error("[98C] Up 挂单失败:", r.error || "无 orderId");
         }
         continue;
       }
-
-      // 消费延迟信号
-      if (latencySignalDirection) latencySignalDirection = null;
-
-      // 用市场概率验证方向
-      const upAsk = ctx.yesBook?.asks?.[0] ? parseFloat(ctx.yesBook.asks[0].price) : 0.5;
-      const downAsk = ctx.noBook?.asks?.[0] ? parseFloat(ctx.noBook.asks[0].price) : 0.5;
-      const upBid = ctx.yesBook?.bids?.[0] ? parseFloat(ctx.yesBook.bids[0].price) : 0.5;
-      const downBid = ctx.noBook?.bids?.[0] ? parseFloat(ctx.noBook.bids[0].price) : 0.5;
-
-      const marketDir = upBid > downBid ? "up" : "down";
-
-      const startPrice = marketStartPrices.get(mKey);
-      if (lastBtcPrice > 0) {
-        const diff = startPrice ? lastBtcPrice - startPrice : 0;
-        const absDiff = startPrice ? Math.abs(diff) : 0;
-        const btcDir = diff > 0 ? "up" : "down";
-
-        const dir = marketDir;
-
-        // 安全检查1：BTC 方向与市场方向需一致
-        const btcAgrees = !startPrice || btcDir === dir || absDiff < 20;
-
-        // 安全检查2：BTC 震荡时不入场
-        if (isBtcChoppy()) {
-          if (nowMs - lastStatusLog < 200) {
-            console.log(`  [⚠CHOPPY] BTC 震荡，跳过入场`);
-          }
+      if (downPr != null) {
+        const cost = downPr * size;
+        const key = `${slug}:down:${downPr}`;
+        if (pendingByKey.has(key)) continue;
+        if (cost < 1) continue;
+        if (!tracker.canBuy(slug, cost)) {
+          if (nowMs - lastStatusLog < 1000) console.log(`[98C] Down@${downPr} 跳过: canBuy=false (额度/笔数限制)`);
           continue;
         }
-
-        const book = dir === "up" ? ctx.yesBook : ctx.noBook;
-        const tokenId = dir === "up" ? ctx.yesTokenId : ctx.noTokenId;
-        const bestAsk = book?.asks?.[0];
-
-        const ensureMinCost = (price: number, minSize: number): number => {
-          if (price * minSize < 1.0) return Math.ceil(1.0 / price);
-          return minSize;
-        };
-
-        const winnerBid = dir === "up" ? upBid : downBid;
-
-        // === 策略1: TREND（要求 BTC 偏离 > $40 + bid >= 0.70 + BTC 方向一致）===
-        if (secsLeft > 120 && winnerBid >= config.trendMinBid && btcAgrees && bestAsk && absDiff >= MIN_BTC_DEVIATION) {
-          const askPrice = parseFloat(bestAsk.price);
-          const askSize = parseFloat(bestAsk.size);
-          const minSize = ensureMinCost(askPrice, 5);
-          const size = Math.max(minSize, Math.min(askSize, config.orderSizeMax));
-
-          if (askPrice >= 0.50 && askPrice <= 0.75 && size >= 5) {
-            const cost = askPrice * size;
-            if (tracker.canBuy(slug, cost) && cost >= 1.0) {
-              console.log(`[TREND] ${dir === "up" ? "Up" : "Down"} bid=${winnerBid} ask=${askPrice} BTC${diff >= 0 ? "+" : ""}$${diff.toFixed(0)} | @${askPrice} x${size}=$${cost.toFixed(2)} | ${Math.round(secsLeft)}s`);
-              try {
-                const signal = {
-                  type: "ev_arb" as const,
-                  tokenId,
-                  side: "BUY" as const,
-                  price: askPrice,
-                  size,
-                  theoreticalProb: 0,
-                  marketPrice: askPrice,
-                  secondsLeft: secsLeft,
-                };
-                const r = await executeSignal(client, signal, ctx.tickSize, ctx.negRisk);
-                if (r.ok) {
-                  console.log(`[TREND] 买入成功:`, r.orderIds);
-                  tracker.recordBuy(tokenId, dir as "up" | "down", askPrice, size, slug);
-                  // 买入后 sync token 授权（重试 3 次）
-                  for (let si = 0; si < 3; si++) {
-                    const ok = await client.syncTokenBalance(tokenId);
-                    if (ok) break;
-                    await new Promise((r) => setTimeout(r, 2000));
-                  }
-                } else {
-                  console.error(`[TREND] 买入失败:`, r.error);
-                }
-              } catch (e) {
-                console.error("[TREND] err:", e);
-              }
-              continue;
-            }
-          }
+        const signal = { type: "latency" as const, direction: "down" as const, tokenId: ctx.noTokenId, price: downPr, size, reason: `98/99C Down 挂单` };
+        const r = await executeSignal(client, signal, ctx.tickSize, ctx.negRisk);
+        if (r.ok && r.orderIds[0]) {
+          pendingByKey.set(key, { orderId: r.orderIds[0], tokenId: ctx.noTokenId, side: "down", size, price: downPr, slug, placedAt: nowMs, marketEndMs: endMs });
+          console.log(`[98C] Down 挂单成功 @${downPr} x${size} orderId=${r.orderIds[0].slice(0, 10)}…`);
+        } else {
+          console.error("[98C] Down 挂单失败:", r.error || "无 orderId");
         }
-
-        // === 策略2: ENDGAME（末日轮，持有到结算）===
-        if (secsLeft <= 120 && secsLeft >= 15 && winnerBid >= 0.80 && bestAsk) {
-          const askPrice = parseFloat(bestAsk.price);
-          const askSize = parseFloat(bestAsk.size);
-          const minSize = ensureMinCost(askPrice, 5);
-          const size = Math.max(minSize, Math.min(askSize, config.orderSizeMax));
-
-          if (askPrice <= config.endgameMaxAsk && size >= 5) {
-            const cost = askPrice * size;
-            const expectedProfit = (1.0 - askPrice) * size;
-            if (tracker.canBuy(slug, cost) && cost >= 1.0) {
-              console.log(`[ENDGAME] ${dir === "up" ? "Up" : "Down"} bid=${winnerBid} @${askPrice} x${size} | cost=$${cost.toFixed(2)} 利润=$${expectedProfit.toFixed(2)} | ${Math.round(secsLeft)}s left`);
-              try {
-                const signal = {
-                  type: "ev_arb" as const,
-                  tokenId,
-                  side: "BUY" as const,
-                  price: askPrice,
-                  size,
-                  theoreticalProb: 0,
-                  marketPrice: askPrice,
-                  secondsLeft: secsLeft,
-                };
-                const r = await executeSignal(client, signal, ctx.tickSize, ctx.negRisk);
-                if (r.ok) {
-                  console.log(`[ENDGAME] 买入成功:`, r.orderIds, `→ 等结算 (~${Math.round(secsLeft)}s)`);
-                  tracker.recordBuy(tokenId, dir as "up" | "down", askPrice, size, slug);
-                  for (let si = 0; si < 3; si++) {
-                    const ok = await client.syncTokenBalance(tokenId);
-                    if (ok) break;
-                    await new Promise((r) => setTimeout(r, 2000));
-                  }
-                } else {
-                  console.error(`[ENDGAME] 买入失败:`, r.error);
-                }
-              } catch (e) {
-                console.error("[ENDGAME] err:", e);
-              }
-              continue;
-            }
-          }
-        }
-
-        // 状态日志
-        if (nowMs - lastStatusLog < 200 && bestAsk) {
-          const askP = parseFloat(bestAsk.price);
-          const zone = secsLeft <= 120 ? "🔴末日轮" : secsLeft <= 300 ? "🟡末5min" : "⚪监控中";
-          const dirStr = dir === "up" ? "Up" : "Down";
-          const deviationStr = absDiff >= MIN_BTC_DEVIATION ? "" : ` (BTC偏离$${absDiff.toFixed(0)}<$${MIN_BTC_DEVIATION})`;
-          console.log(`  [${zone}] BTC${diff > 0 ? "+" : ""}$${diff.toFixed(0)} | ${dirStr} ask=${askP} | ${Math.round(secsLeft)}s${deviationStr}`);
-        }
-      } else if (latencySignalDirection) {
-        latencySignalDirection = null;
-      }
-
-      // --- NegRisk（保留） ---
-      if (config.strategyNegRiskArb && ctx.yesBook?.asks?.[0] && ctx.noBook?.asks?.[0]) {
-        const askYes = parseFloat(ctx.yesBook.asks[0].price);
-        const askNo = parseFloat(ctx.noBook.asks[0].price);
-        const sum = askYes + askNo;
-
-        if (nowMs - lastStatusLog < 200) {
-          console.log(`  [NegRisk] Up=${askYes} Down=${askNo} sum=${sum.toFixed(3)} (need <${config.negRiskMaxSum})`);
-        }
-
-        const negSignal = checkNegRiskArb(ctx, { maxSum: config.negRiskMaxSum, orderSizeMin: config.orderSizeMin, orderSizeMax: config.orderSizeMax });
-        if (negSignal) {
-          const cost = negSignal.askYes * negSignal.size + negSignal.askNo * negSignal.size;
-          if (tracker.canBuy(slug, cost)) {
-            console.log(`[ENTER] NegRisk: sum=${negSignal.sum.toFixed(3)} 保底利润!`);
-            const r = await executeSignal(client, negSignal, ctx.tickSize, ctx.negRisk);
-            if (r.ok) {
-              console.log("[ENTER] NegRisk 成功:", r.orderIds);
-              tracker.recordBuy(negSignal.yesTokenId, "up", negSignal.askYes, negSignal.size, slug);
-              tracker.recordBuy(negSignal.noTokenId, "down", negSignal.askNo, negSignal.size, slug);
-            }
-          }
-        }
+        continue;
       }
     }
   };
@@ -632,14 +454,16 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     } catch (e) {
       console.error("[WARN] runOnce err:", e instanceof Error ? e.message : e);
     }
-    const pollMs = tracker.hasOpenPosition() ? 1000
-      : marketResult.inWindow.length > 0 ? FAST_POLL_MS
-      : IDLE_POLL_MS;
+    const pollMs = tracker.hasOpenPosition()
+      ? FAST_POLL_MS
+      : marketResult.inWindow.length > 0
+        ? FAST_POLL_MS
+        : IDLE_POLL_MS;
     setTimeout(smartPoll, pollMs);
   };
 
   smartPoll();
 
-  process.on("SIGINT", () => { if (okxWs) closeOkxWs(okxWs); requestStop(); process.exit(0); });
-  process.on("SIGTERM", () => { if (okxWs) closeOkxWs(okxWs); requestStop(); process.exit(0); });
+  process.on("SIGINT", () => { requestStop(); process.exit(0); });
+  process.on("SIGTERM", () => { requestStop(); process.exit(0); });
 }

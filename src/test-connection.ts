@@ -4,7 +4,7 @@
 import "dotenv/config";
 import { ClobClient, AssetType } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
-import { getBtc15MinMarkets, normalizeMarket } from "./api/gamma.js";
+import { getBtc5MinMarkets, normalizeMarket } from "./api/gamma.js";
 import { CHAIN_ID, CLOB_HOST, loadConfig } from "./config/index.js";
 
 async function main() {
@@ -70,14 +70,11 @@ async function main() {
     console.error("   查挂单失败:", e?.message || e);
   }
 
-  // 4. 拉取一个 BTC 15min 市场来测试
-  console.log("\n4. 拉取 BTC 15min 市场...");
+  // 4. 拉取 BTC 5min 市场来测试
+  console.log("\n4. 拉取 BTC 5min 市场...");
   let testMarket: any = null;
   try {
-    const result = await getBtc15MinMarkets(
-      config.btc15MinTagId || undefined,
-      config.btc15MinSlug || undefined
-    );
+    const result = await getBtc5MinMarkets();
     const markets = result.inWindow.length > 0 ? result.inWindow : result.allMarkets;
     console.log(`   找到 ${markets.length} 个市场 (inWindow=${result.inWindow.length}, upcoming=${result.upcoming.length}, total=${result.allMarkets.length})`);
     if (markets.length > 0) {
