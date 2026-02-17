@@ -10,10 +10,11 @@ export interface EnvConfig {
   polyApiKey?: string;
   polySecret?: string;
   polyPassphrase?: string;
-
   // 98 概率买入（BTC 5min）
   /** 每次买入多少 shares（固定张数） */
   buy98OrderSizeShares: number;
+  /** 单市场最大持仓金额（美元），需 ≥ 单笔成本（如 100 shares @ 0.99 = $99） */
+  buy98OrderMaxPositionPerMarket: number;
   /** 允许挂单的价格列表（如 [0.99, 0.98]） */
   buy98OrderPrices: number[];
 }
@@ -23,6 +24,7 @@ const defaultConfig: EnvConfig = {
   funderAddress: "",
   signatureType: 2,
   buy98OrderSizeShares: 20,
+  buy98OrderMaxPositionPerMarket: 150,
   buy98OrderPrices: [0.99, 0.98],
 };
 
@@ -53,6 +55,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     polyPassphrase: env.POLY_PASSPHRASE,
 
     buy98OrderSizeShares: parseNum(env.BUY98_ORDER_SIZE_SHARES, defaultConfig.buy98OrderSizeShares),
+    buy98OrderMaxPositionPerMarket: parseNum(env.BUY98_MAX_POSITION_PER_MARKET, defaultConfig.buy98OrderMaxPositionPerMarket),
     // 新：逗号分隔，如 "0.98,0.99"；兼容旧 BUY98_ORDER_PRICE
     buy98OrderPrices: parseNumList(env.BUY98_ORDER_PRICES ?? env.BUY98_ORDER_PRICE, defaultConfig.buy98OrderPrices),
   };

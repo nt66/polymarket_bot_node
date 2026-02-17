@@ -117,7 +117,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     profitTarget: 0.01,
     stopLoss: 0.80, // 止损 跌了0.80C
     maxHoldMs: 280_000,
-    maxPositionPerMarket: 50,
+    maxPositionPerMarket: config.buy98OrderMaxPositionPerMarket,
     maxTradesPerWindow: 10,
   });
 
