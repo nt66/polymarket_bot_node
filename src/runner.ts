@@ -369,25 +369,22 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       // 只做 98/99 两档，97 不买
       const orderPrices = config.buy98OrderPrices.filter((p) => p >= 0.98);
 
-      // 价格差过滤：仅最后 10 秒，若 BTC 当前价与 Price to Beat 之差的绝对值 < 15 美元，不挂单
+      // 价格差过滤：若 BTC 当前价与 Price to Beat 之差的绝对值 < 15 美元，本拍不挂单（与 0.98/0.99 条件同级）
       const DOLLAR_DIFF_RISK = 15;
-      const REMAINING_TIME_RISK_SEC = 10;
-      if (secsLeft < REMAINING_TIME_RISK_SEC) {
-        const slotStartMatch = slug.match(/btc-updown-5m-(\d+)/);
-        const slotStart = slotStartMatch ? parseInt(slotStartMatch[1], 10) : 0;
-        let priceToBeat = slotStart ? priceToBeatBySlug.get(slug) : undefined;
-        if (slotStart && priceToBeat == null) {
-          const p = await getBtcPriceAtTimestamp(slotStart);
-          if (p != null) {
-            priceToBeatBySlug.set(slug, p);
-            priceToBeat = p;
-          }
+      const slotStartMatch = slug.match(/btc-updown-5m-(\d+)/);
+      const slotStart = slotStartMatch ? parseInt(slotStartMatch[1], 10) : 0;
+      let priceToBeat = slotStart ? priceToBeatBySlug.get(slug) : undefined;
+      if (slotStart && priceToBeat == null) {
+        const p = await getBtcPriceAtTimestamp(slotStart);
+        if (p != null) {
+          priceToBeatBySlug.set(slug, p);
+          priceToBeat = p;
         }
-        const currentBtc = await getCurrentBtcPrice();
-        if (priceToBeat != null && currentBtc != null && Math.abs(currentBtc - priceToBeat) < DOLLAR_DIFF_RISK) {
-          console.log("[98C] 风险过高，本轮不挂单（剩余 " + Math.round(secsLeft) + "s，BTC 价差 |" + currentBtc.toFixed(2) + " - " + priceToBeat.toFixed(2) + "| < " + DOLLAR_DIFF_RISK + " 美元）");
-          continue;
-        }
+      }
+      const currentBtc = await getCurrentBtcPrice();
+      if (priceToBeat != null && currentBtc != null && Math.abs(currentBtc - priceToBeat) < DOLLAR_DIFF_RISK) {
+        console.log("[98C] BTC 价差不足 " + DOLLAR_DIFF_RISK + " 美元，本拍不挂单（|" + currentBtc.toFixed(2) + " - " + priceToBeat.toFixed(2) + "| < " + DOLLAR_DIFF_RISK + "）");
+        continue;
       }
       const orderShares = Math.max(5, Math.floor(config.buy98OrderSizeShares));
       const tickSize = parseFloat(ctx.tickSize || "0.01");
