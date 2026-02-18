@@ -375,7 +375,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           if (pr >= 0.99) {
             if (inBand(ask, 0.985, 0.9999) || inBand(bid, 0.985, 0.9999)) return pr;
           } else {
-            if (inBand(ask, 0.979, 0.984) || inBand(bid, 0.979, 0.984)) return pr;
+            if (inBand(ask, 0.978, 0.984) || inBand(bid, 0.978, 0.984)) return pr;
           }
         }
         return null;
