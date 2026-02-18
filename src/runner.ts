@@ -359,9 +359,22 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       const downAsk = ctx.noBook?.asks?.[0] ? parseFloat(ctx.noBook.asks[0].price) : 1;
       lastSnapshotBySlug.set(slug, { upBid, upAsk, downBid, downAsk, endTime: market.endDate || "" });
 
+      // 最后 15 秒不挂单
       if (secsLeft <= 15) continue;
 
-      // ========== 98/99C 挂单（价从 .env）、单子挂到下轮再撤、盈利即卖 ==========
+      // 价格差过滤：最后 10 秒若市价与目标价相差不足 5 美元（按本次下单张数算），撤单保平安
+      // 做个测试先
+      // const ORDER_SIZE_FOR_RISK = Math.max(5, Math.floor(config.buy98OrderSizeShares));
+      // const DOLLAR_DIFF_RISK = 5;
+      // const REMAINING_TIME_RISK_SEC = 10;
+      // if (secsLeft < REMAINING_TIME_RISK_SEC) {
+      //   const nearTarget = (ask: number) => orderPrices.some((tp) => Number.isFinite(ask) && Math.abs(ask - tp) * ORDER_SIZE_FOR_RISK < DOLLAR_DIFF_RISK);
+      //   if (nearTarget(upAsk) || nearTarget(downAsk)) {
+      //     console.log("[98C] 风险过高，本轮不挂单（剩余 " + Math.round(secsLeft) + "s，价差不足 5 美元）");
+      //     continue;
+      //   }
+      // }
+
       // 只做 98/99 两档，97 不买
       const orderPrices = config.buy98OrderPrices.filter((p) => p >= 0.98);
       const orderShares = Math.max(5, Math.floor(config.buy98OrderSizeShares));
