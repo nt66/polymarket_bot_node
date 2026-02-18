@@ -9,9 +9,19 @@
     "start": "node dist/index.js start",
     "stop": "node dist/index.js stop",
     "dev": "tsx src/index.ts start",
-    "test:connection": "tsx src/test-connection.ts"
+    "test:connection": "tsx src/test-connection.ts",
+    "pm2:start": "pm2 start ecosystem.config.cjs",
+    "pm2:stop": "pm2 stop polymarket-bot",
+    "pm2:restart": "pm2 restart polymarket-bot",
+    "pm2:logs": "pm2 logs polymarket-bot",
+    "pm2:status": "pm2 status polymarket-bot"
   },
-  "keywords": ["polymarket", "arbitrage", "btc", "crypto"],
+  "keywords": [
+    "polymarket",
+    "arbitrage",
+    "btc",
+    "crypto"
+  ],
   "author": "",
   "license": "MIT",
   "engines": {

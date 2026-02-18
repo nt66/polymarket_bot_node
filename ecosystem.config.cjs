@@ -1,11 +1,7 @@
 /**
- * PM2 进程配置：远程部署时用 PM2 管理 bot，便于停止与查看输出
+ * PM2 进程配置：用 PM2 管理 98 概率买入 Bot，后台常驻、方便启停与看日志
  *
- * 使用：
- *   pm2 start ecosystem.config.cjs     # 启动
- *   pm2 stop polymarket-bot           # 停止
- *   pm2 logs polymarket-bot           # 实时看终端输出
- *   pm2 status                        # 查看状态
+ * 先构建再启动：npm run build && pm2 start ecosystem.config.cjs
  */
 module.exports = {
   apps: [
@@ -14,6 +10,7 @@ module.exports = {
       script: "dist/index.js",
       args: "start",
       cwd: __dirname,
+      interpreter: "node",
       instances: 1,
       autorestart: true,
       watch: false,

@@ -1,44 +1,38 @@
-# Polymarket BTC 15min 套利 Bot
+# Polymarket 98 概率买入 Bot（BTC 5min）
 
-Node.js + TypeScript 实现的 Polymarket 套利机器人，目标板块为 **Crypto BTC 15min**，支持三种策略与启动/停止命令。
+Node.js + TypeScript 实现的 Polymarket 机器人，专注 **BTC 5 分钟 Up/Down** 市场：在 0.98/0.99 挂单买入，盈利即卖。
 
 ## 功能
 
-1. **连接 Polymarket API**：自动买入/卖出（通过 CLOB + 私钥/API 凭证）
-2. **目标板块**：Crypto BTC 15min（可通过 Gamma tag 或 slug 配置）
-3. **三种套利策略**：
-   - **跨平台信息差套利 (Latency Arbitrage)**：监控 OKX WebSocket BTC 价格，跳动超过阈值时在 Polymarket 吃旧价挂单
-   - **负风险组合套利 (Negative Risk Arb)**：当 YES 卖一 + NO 卖一 < 1（扣除手续费）时同时买入两边
-   - **末日轮概率博弈 (Expected Value Arb)**：结算前 1–2 分钟根据理论胜率与市场票价差下注
-4. **启动/停止**：`npm run start` 启动，`npm run stop` 请求停止（或创建 `.polymarket-bot-stop` 文件）
+1. **目标**：BTC Up or Down 5min 市场，挂单价从 `.env` 配置（如 0.98、0.99）
+2. **逻辑**：盘口进入目标价格带时挂限价单，成交后监控买一，涨 0.01 即止盈卖出；最后 15 秒不挂新单，最后 10 秒若 BTC 当前价与 Price to Beat 差 < 5 美元则不挂单
+3. **启动/停止**：可直接 `npm run start`，或使用 **PM2** 后台运行（推荐）
 
-## 项目结构（模块化）
+## 项目结构
 
 ```
 src/
   config/         # 配置（环境变量）
-  api/           # Gamma、CLOB、OKX WebSocket
-  strategies/    # 三种策略逻辑
-  execution/     # 下单执行
-  runner.ts      # 主循环
-  index.ts       # CLI 入口
+  api/            # Gamma、CLOB、BTC 价格（OKX/Binance）
+  execution/      # 下单执行
+  risk/           # 持仓与风控
+  util/           # 按日日志（ET 时间）
+  runner.ts       # 主循环（98 挂单 + 止盈）
+  index.ts        # CLI 入口
 ```
 
 ## 环境变量
 
 复制 `.env.example` 为 `.env` 并填写：
 
-- `PRIVATE_KEY`：Polymarket 账户私钥（从 reveal.polymarket.com 或钱包导出）
-- `POLYMARKET_FUNDER_ADDRESS`：Polymarket 资金地址（设置页面的 Profile 地址）
+- `PRIVATE_KEY`：Polymarket 账户私钥
+- `POLYMARKET_FUNDER_ADDRESS`：Polymarket 资金地址（Profile 地址）
 - `SIGNATURE_TYPE`：0=EOA, 1=Magic/Email, 2=Gnosis Safe（常用 2）
-- 可选：`POLY_API_KEY` / `POLY_SECRET` / `POLY_PASSPHRASE`（不填则用私钥自动 createOrDerive）
-- `STRATEGY_LATENCY_ARB` / `STRATEGY_NEG_RISK_ARB` / `STRATEGY_EV_ARB`：策略开关（true/false）
-- `LATENCY_PRICE_JUMP_THRESHOLD`：OKX 价格跳动阈值（美元）
-- `NEG_RISK_MAX_SUM`：负风险套利 YES+NO 买一价之和上限（如 0.98）
-- `EV_ARB_LAST_SECONDS`：末日轮在最后多少秒内启动（如 120）
-- **`BTC_15MIN_SLUG`**（推荐）或 **`BTC_15MIN_TAG_ID`**：必填其一，否则不会拉取到市场、也不会下单。打开 [polymarket.com/crypto/15M](https://polymarket.com/crypto/15M)，点进某个「BTC Up/Down」事件，浏览器地址栏里 `/event/` 后面的那一段即为 slug（如 `btc-updown-15m-1739347200`），填到 `BTC_15MIN_SLUG`
+- `BUY98_ORDER_PRICES`：允许挂单的价格，逗号分隔，如 `0.98,0.99`
+- `BUY98_ORDER_SIZE_SHARES`：每次买入张数，如 `50`
+- `BUY98_MAX_POSITION_PER_MARKET`：单市场最大持仓金额（美元），如 `150`
 
-## 命令
+## 命令（本地直接跑）
 
 ```bash
 npm install
@@ -48,55 +42,65 @@ npm run stop     # 请求停止（下次轮询时退出）
 npm run dev      # 开发模式（tsx 直接跑 src）
 ```
 
-## 远程部署：停止服务与查看输出
+## PM2 启动 / 关闭 / 重启（推荐）
 
-部署到远程机器后，若用 SSH 直接跑 `npm run start`，断开连接后进程会退出，且不方便随时看日志。推荐用 **PM2** 管理进程，既能后台常驻，又能随时停止、查看终端输出。
+用 PM2 可后台常驻、断 SSH 不退出，并方便启停与看日志。
 
-### 1. 安装 PM2（远程机上一次即可）
+### 安装 PM2（一次即可）
 
 ```bash
 npm install -g pm2
 ```
 
-### 2. 启动服务（在项目根目录执行）
+### 启动
+
+在项目根目录执行（先构建再启动）：
 
 ```bash
-cd /path/to/polymarket_bot_node
 npm run build
 mkdir -p logs
-pm2 start ecosystem.config.cjs
+npm run pm2:start
 ```
 
-### 3. 停止服务
+或直接：`pm2 start ecosystem.config.cjs`
 
-任选其一即可：
-
-- **推荐**：`pm2 stop polymarket-bot` — 停止进程（可随时 `pm2 start polymarket-bot` 再启）
-- 或在同一项目目录下执行 `npm run stop` — 写入停止标记，bot 下次轮询时自己退出（优雅退出）
-- 或 `pm2 delete polymarket-bot` — 从 PM2 列表移除（需再启动时用 `pm2 start ecosystem.config.cjs`）
-
-### 4. 查看终端输出
-
-- **实时看日志（类似 terminal 输出）**：`pm2 logs polymarket-bot`
-- 只看最近 200 行：`pm2 logs polymarket-bot --lines 200`
-- 查看状态：`pm2 status`
-- 日志也写在 `./logs/out.log` 和 `./logs/err.log`，可直接 `tail -f logs/out.log`
-
-### 5. 其他常用命令
+### 关闭（停止）
 
 ```bash
-pm2 restart polymarket-bot   # 重启
-pm2 flush polymarket-bot     # 清空当前日志缓冲
+npm run pm2:stop
 ```
 
-若不想用 PM2，也可用 **screen** / **tmux**：在 session 里运行 `npm run start`，需要看输出时 SSH 上去执行 `screen -r` 或 `tmux attach` 即可；停止时在同一 session 里 Ctrl+C，或另开终端到项目目录执行 `npm run stop`。
+或：`pm2 stop polymarket-bot`。停止后进程仍在 PM2 列表中，可再次 `npm run pm2:start`。
+
+### 重启
+
+```bash
+npm run pm2:restart
+```
+
+改完代码或配置后，先 `npm run build` 再执行上述重启。
+
+### 查看状态与日志
+
+| 命令 | 说明 |
+|------|------|
+| `npm run pm2:status` | 查看进程状态（运行中/已停） |
+| `npm run pm2:logs` | 实时看终端输出 |
+| `pm2 logs polymarket-bot --lines 200` | 最近 200 行 |
+| `tail -f logs/out.log` | 看标准输出文件 |
+| `tail -f logs/err.log` | 看错误输出文件 |
+
+### 其他
+
+- **从 PM2 移除**：`pm2 delete polymarket-bot`（之后要启动需重新 `pm2 start ecosystem.config.cjs`）
+- **优雅停止**：在项目目录执行 `npm run stop`，bot 会在下次轮询时自行退出（PM2 进程仍存在，状态会变为 stopped）
 
 ## 依赖
 
 - Node.js >= 18
 - `@polymarket/clob-client`：Polymarket 下单与认证
 - `@ethersproject/wallet`：与 CLOB 兼容的签名
-- `ws`：OKX WebSocket
+- `ws`：WebSocket
 - `dotenv`：加载 .env
 
 ## 风险与合规

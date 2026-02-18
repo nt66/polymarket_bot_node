@@ -1,11 +1,13 @@
 /**
  * 按天写入日志文件：logs/YYYY-MM-DD.log
+ * 时间用 ET 显示，格式与网站一致：February 18, 1:35AM ET
  */
 
 import * as fs from "fs";
 import * as path from "path";
 
 const LOG_DIR = path.join(process.cwd(), "logs");
+const TZ_ET = "America/New_York";
 
 function dateStr(d: Date = new Date()): string {
   const y = d.getFullYear();
@@ -14,8 +16,29 @@ function dateStr(d: Date = new Date()): string {
   return `${y}-${m}-${day}`;
 }
 
-function timeStr(d: Date = new Date()): string {
-  return d.toISOString();
+/** 单时刻：February 18, 1:35AM ET */
+function formatEt(d: Date): string {
+  const month = d.toLocaleString("en-US", { timeZone: TZ_ET, month: "long" });
+  const day = d.toLocaleString("en-US", { timeZone: TZ_ET, day: "numeric" });
+  const time = d
+    .toLocaleString("en-US", { timeZone: TZ_ET, hour: "numeric", minute: "2-digit", hour12: true })
+    .replace(/\s+/g, "");
+  return `${month} ${day}, ${time} ET`;
+}
+
+/** 5 分钟窗口：February 18, 1:35-1:40AM ET（endTime 为窗口结束时刻） */
+export function formatEtWindow(endTimeIso: string): string {
+  const end = new Date(endTimeIso);
+  const start = new Date(end.getTime() - 5 * 60 * 1000);
+  const month = end.toLocaleString("en-US", { timeZone: TZ_ET, month: "long" });
+  const day = end.toLocaleString("en-US", { timeZone: TZ_ET, day: "numeric" });
+  const startTime = start
+    .toLocaleString("en-US", { timeZone: TZ_ET, hour: "numeric", minute: "2-digit", hour12: true })
+    .replace(/\s+/g, "");
+  const endTime = end
+    .toLocaleString("en-US", { timeZone: TZ_ET, hour: "numeric", minute: "2-digit", hour12: true })
+    .replace(/\s+/g, "");
+  return `${month} ${day}, ${startTime}-${endTime} ET`;
 }
 
 function logFilePath(datePrefix: string): string {
@@ -37,7 +60,7 @@ export function logDaily(line: string): void {
   try {
     ensureLogDir();
     const file = logFilePath(dateStr());
-    const ts = timeStr();
+    const ts = formatEt(new Date());
     fs.appendFileSync(file, `${ts} ${line}\n`, "utf8");
   } catch (e) {
     console.error("[daily-log]", e instanceof Error ? e.message : e);
@@ -71,5 +94,6 @@ export function logRoundEnd(params: {
   downAsk: number;
 }): void {
   const { slug, endTime, upBid, upAsk, downBid, downAsk } = params;
-  logDaily(`ROUND_END slug=${slug} endTime=${endTime} Up_bid=${upBid} Up_ask=${upAsk} Down_bid=${downBid} Down_ask=${downAsk}`);
+  const windowEt = formatEtWindow(endTime);
+  logDaily(`ROUND_END slug=${slug} window=${windowEt} Up_bid=${upBid} Up_ask=${upAsk} Down_bid=${downBid} Down_ask=${downAsk}`);
 }
