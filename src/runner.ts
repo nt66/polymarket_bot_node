@@ -7,6 +7,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { getBtc5MinMarketsFast } from "./api/gamma.js";
 import { getOrderBooks, createPolymarketClient } from "./api/clob.js";
+import { getCurrentBtcPrice, getBtcPriceAtTimestamp } from "./api/btc-price.js";
 import type { GammaMarket, Btc15mResult } from "./api/gamma.js";
 import type { MarketContext } from "./strategies/types.js";
 import { executeSignal } from "./execution/executor.js";
@@ -108,6 +109,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
   // 每轮结束时的盘口快照，用于按天日志 ROUND_END（slug -> 最后一笔 Up/Down 价格）
   const lastSnapshotBySlug = new Map<string, { upBid: number; upAsk: number; downBid: number; downAsk: number; endTime: string }>();
+  // Price to beat 缓存（slug -> 该轮开始时 BTC 价格，美元），用于最后 10 秒价差过滤
+  const priceToBeatBySlug = new Map<string, number>();
 
   // === 未成交挂单：本轮挂着，下一轮 5min 再取消（支持同轮 0.98 + 0.99 两档同时挂）===
   // key: `${slug}:${side}:${price}`
@@ -262,6 +265,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
     const activeSlugs = new Set(activeMarkets.map((m) => m.slug || "").filter(Boolean));
     tracker.cleanupExpiredMarkets(activeSlugs);
+    for (const k of priceToBeatBySlug.keys()) if (!activeSlugs.has(k)) priceToBeatBySlug.delete(k);
 
     const roundEndLogged = new Set<string>();
     for (const [k, p] of pendingByKey.entries()) {
@@ -362,16 +366,29 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       // 最后 15 秒不挂单
       if (secsLeft <= 15) continue;
 
-      // 价格差过滤：若市价与目标价相差不足 15 美元（按本次下单张数算），不下单保平安
-      const ORDER_SIZE_FOR_RISK = Math.max(15, Math.floor(config.buy98OrderSizeShares));
-      const DOLLAR_DIFF_RISK = 15;
-      const nearTarget = (ask: number) => orderPrices.some((tp) => Number.isFinite(ask) && Math.abs(ask - tp) * ORDER_SIZE_FOR_RISK < DOLLAR_DIFF_RISK);
-      if (nearTarget(upAsk) || nearTarget(downAsk)) {
-        console.log("[98C] 继续等待、本拍不下单（剩余 " + Math.round(secsLeft) + "s，价差不足 15 美元）");
-        continue;
-      }
       // 只做 98/99 两档，97 不买
       const orderPrices = config.buy98OrderPrices.filter((p) => p >= 0.98);
+
+      // 价格差过滤：仅最后 10 秒，若 BTC 当前价与 Price to Beat 之差的绝对值 < 15 美元，不挂单
+      const DOLLAR_DIFF_RISK = 15;
+      const REMAINING_TIME_RISK_SEC = 10;
+      if (secsLeft < REMAINING_TIME_RISK_SEC) {
+        const slotStartMatch = slug.match(/btc-updown-5m-(\d+)/);
+        const slotStart = slotStartMatch ? parseInt(slotStartMatch[1], 10) : 0;
+        let priceToBeat = slotStart ? priceToBeatBySlug.get(slug) : undefined;
+        if (slotStart && priceToBeat == null) {
+          const p = await getBtcPriceAtTimestamp(slotStart);
+          if (p != null) {
+            priceToBeatBySlug.set(slug, p);
+            priceToBeat = p;
+          }
+        }
+        const currentBtc = await getCurrentBtcPrice();
+        if (priceToBeat != null && currentBtc != null && Math.abs(currentBtc - priceToBeat) < DOLLAR_DIFF_RISK) {
+          console.log("[98C] 风险过高，本轮不挂单（剩余 " + Math.round(secsLeft) + "s，BTC 价差 |" + currentBtc.toFixed(2) + " - " + priceToBeat.toFixed(2) + "| < " + DOLLAR_DIFF_RISK + " 美元）");
+          continue;
+        }
+      }
       const orderShares = Math.max(5, Math.floor(config.buy98OrderSizeShares));
       const tickSize = parseFloat(ctx.tickSize || "0.01");
       const roundToTick = (n: number) => Number((Math.floor(n / tickSize) * tickSize).toFixed(4));

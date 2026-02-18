@@ -67,7 +67,7 @@ npm run pm2:start
 ### 关闭（停止）
 
 ```bash
-npm run pm2:stop
+pnpm run pm2:stop
 ```
 
 或：`pm2 stop polymarket-bot`。停止后进程仍在 PM2 列表中，可再次 `npm run pm2:start`。
@@ -82,13 +82,13 @@ npm run pm2:restart
 
 ### 查看状态与日志
 
-| 命令 | 说明 |
-|------|------|
-| `npm run pm2:status` | 查看进程状态（运行中/已停） |
-| `npm run pm2:logs` | 实时看终端输出 |
-| `pm2 logs polymarket-bot --lines 200` | 最近 200 行 |
-| `tail -f logs/out.log` | 看标准输出文件 |
-| `tail -f logs/err.log` | 看错误输出文件 |
+| 命令                                  | 说明                        |
+| ------------------------------------- | --------------------------- |
+| `npm run pm2:status`                  | 查看进程状态（运行中/已停） |
+| `npm run pm2:logs`                    | 实时看终端输出              |
+| `pm2 logs polymarket-bot --lines 200` | 最近 200 行                 |
+| `tail -f logs/out.log`                | 看标准输出文件              |
+| `tail -f logs/err.log`                | 看错误输出文件              |
 
 ### 日志轮转（避免 out.log 无限变大）
 
