@@ -90,6 +90,24 @@ npm run pm2:restart
 | `tail -f logs/out.log` | 看标准输出文件 |
 | `tail -f logs/err.log` | 看错误输出文件 |
 
+### 日志轮转（避免 out.log 无限变大）
+
+PM2 默认一直往同一文件追加，长期运行会占满磁盘。建议安装 **pm2-logrotate** 按大小或按天轮转：
+
+```bash
+pm2 install pm2-logrotate
+```
+
+可选配置（例如单文件最大 10M、保留 3 个备份）：
+
+```bash
+pm2 set pm2-logrotate:max_size 10M
+pm2 set pm2-logrotate:retain 3
+pm2 set pm2-logrotate:compress true
+```
+
+之后 `logs/out.log` 超过 10M 会自动轮转为 `out.log.1` 等并压缩，只保留最近 3 份。
+
 ### 其他
 
 - **从 PM2 移除**：`pm2 delete polymarket-bot`（之后要启动需重新 `pm2 start ecosystem.config.cjs`）
