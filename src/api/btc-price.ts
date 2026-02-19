@@ -1,11 +1,9 @@
 /**
  * 币种价格：当前价 + 历史价（用于 Price to Beat）
- * 当前价走 OKX，历史价走 Binance Kline（公开接口）。
+ * 当前价与历史价均走 OKX，数据源一致，避免 Binance/OKX 价差带来的“时间差”风险。
  */
 
-import { fetchBtcPriceHttp, fetchSpotPriceHttp } from "./okx-ws.js";
-
-const BINANCE_KLINE = "https://api.binance.com/api/v3/klines";
+import { fetchBtcPriceHttp, fetchSpotPriceHttp, fetchOkxCandleOpenHttp } from "./okx-ws.js";
 
 /** 当前价缓存 1 秒，避免轮询时每轮都打 OKX */
 let cachedBtc: { price: number; at: number } | null = null;
@@ -46,39 +44,23 @@ export async function getCurrentSolPrice(): Promise<number | null> {
   return price ?? null;
 }
 
-async function getPriceAtTimestamp(symbol: string, unixSec: number): Promise<number | null> {
-  try {
-    const candleStartMs = Math.floor(unixSec / 60) * 60 * 1000;
-    const url = `${BINANCE_KLINE}?symbol=${symbol}&interval=1m&startTime=${candleStartMs}&limit=1`;
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const arr = (await res.json()) as unknown[];
-    const candle = arr[0] as [number, string, string, string, string, ...unknown[]] | undefined;
-    if (!candle || !candle[1]) return null;
-    const open = parseFloat(candle[1]);
-    return Number.isFinite(open) ? open : null;
-  } catch {
-    return null;
-  }
-}
-
 /**
- * 指定 Unix 秒时刻的 BTC 价格（用于 5min 市场的 Price to Beat）
+ * 指定 Unix 秒时刻的 BTC 价格（用于 5min 市场的 Price to Beat，OKX 1m K 线开盘价）
  */
 export async function getBtcPriceAtTimestamp(unixSec: number): Promise<number | null> {
-  return getPriceAtTimestamp("BTCUSDT", unixSec);
+  return fetchOkxCandleOpenHttp("BTC-USDT", unixSec);
 }
 
 /**
- * 指定 Unix 秒时刻的 ETH 价格（用于 5min 市场的 Price to Beat）
+ * 指定 Unix 秒时刻的 ETH 价格（用于 5min 市场的 Price to Beat，OKX 1m K 线开盘价）
  */
 export async function getEthPriceAtTimestamp(unixSec: number): Promise<number | null> {
-  return getPriceAtTimestamp("ETHUSDT", unixSec);
+  return fetchOkxCandleOpenHttp("ETH-USDT", unixSec);
 }
 
 /**
- * 指定 Unix 秒时刻的 SOL 价格（用于 5min 市场的 Price to Beat）
+ * 指定 Unix 秒时刻的 SOL 价格（用于 5min 市场的 Price to Beat，OKX 1m K 线开盘价）
  */
 export async function getSolPriceAtTimestamp(unixSec: number): Promise<number | null> {
-  return getPriceAtTimestamp("SOLUSDT", unixSec);
+  return fetchOkxCandleOpenHttp("SOL-USDT", unixSec);
 }
