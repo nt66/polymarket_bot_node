@@ -293,6 +293,14 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
     const activeSlugs = new Set(activeMarkets.map((m) => m.slug || "").filter(Boolean));
     tracker.cleanupExpiredMarkets(activeSlugs);
+    // 轮结束日志需要用到 priceToBeat，先保存再删
+    const roundEndBtcPriceToBeat = new Map<string, number>();
+    for (const [_, p] of pendingByKey.entries()) {
+      if (!activeSlugs.has(p.slug)) {
+        const pt = priceToBeatBySlug.get(p.slug);
+        if (pt != null) roundEndBtcPriceToBeat.set(p.slug, pt);
+      }
+    }
     for (const k of priceToBeatBySlug.keys()) if (!activeSlugs.has(k)) priceToBeatBySlug.delete(k);
 
     const roundEndLogged = new Set<string>();
@@ -307,6 +315,11 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         continue;
       }
       if (!activeSlugs.has(p.slug)) {
+        const roundBtcTarget = roundEndBtcPriceToBeat.get(p.slug);
+        const roundBtcStr =
+          roundBtcTarget != null && currentBtc != null
+            ? ` | BTC 目标=${roundBtcTarget.toFixed(2)} 当前=${currentBtc.toFixed(2)}`
+            : "";
         if (!roundEndLogged.has(p.slug)) {
           const snap = lastSnapshotBySlug.get(p.slug);
           if (snap) {
@@ -317,6 +330,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
               upAsk: snap.upAsk,
               downBid: snap.downBid,
               downAsk: snap.downAsk,
+              btcPriceToBeat: roundBtcTarget,
+              btcNow: currentBtc ?? undefined,
             });
             lastSnapshotBySlug.delete(p.slug);
           }
@@ -324,7 +339,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         }
         await client.cancelOrder(p.orderId);
         pendingByKey.delete(k);
-        console.log(`[98C] 轮结束，取消挂单 ${p.side.toUpperCase()} @${p.price} ${p.slug.slice(0, 20)}…`);
+        console.log(`[98C] 轮结束，取消挂单 ${p.side.toUpperCase()} @${p.price} ${p.slug.slice(0, 20)}…${roundBtcStr}`);
       }
     }
 
@@ -369,11 +384,25 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           continue;
         }
 
-        console.log(`[EXIT] ${sig.reason}`);
+        const btcTarget = priceToBeatBySlug.get(slug);
+        const btcStr =
+          btcTarget != null && currentBtc != null
+            ? ` | BTC 目标=${btcTarget.toFixed(2)} 当前=${currentBtc.toFixed(2)}`
+            : "";
+        console.log(`[EXIT] ${sig.reason}${btcStr}`);
 
         if (pos) {
           const shortReason = sig.reason.includes("止盈") ? "止盈" : sig.reason.includes("止损") ? "止损" : "EXIT";
-          logTrade({ slug: pos.marketSlug, side: pos.side, action: "SELL", price: sig.price, size: sig.size, reason: shortReason });
+          logTrade({
+            slug: pos.marketSlug,
+            side: pos.side,
+            action: "SELL",
+            price: sig.price,
+            size: sig.size,
+            reason: shortReason,
+            btcTarget: btcTarget ?? undefined,
+            btcNow: currentBtc ?? undefined,
+          });
         }
 
         // 使用增强版卖出函数（检查余额 + sync + 重试）
@@ -465,8 +494,20 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         }
 
         tracker.recordBuy(p.tokenId, p.side, p.price, buySize, slug);
-        logTrade({ slug, side: p.side, action: "BUY", price: p.price, size: buySize });
-        console.log(`[98C] ${p.side.toUpperCase()} 成交 ${fullyFilled ? "✓" : "(部分)"} @${p.price} x${buySize}`);
+        const buyBtcStr =
+          priceToBeat != null && currentBtc != null
+            ? ` | BTC 目标=${priceToBeat.toFixed(2)} 当前=${currentBtc.toFixed(2)}`
+            : "";
+        logTrade({
+          slug,
+          side: p.side,
+          action: "BUY",
+          price: p.price,
+          size: buySize,
+          btcTarget: priceToBeat ?? undefined,
+          btcNow: currentBtc ?? undefined,
+        });
+        console.log(`[98C] ${p.side.toUpperCase()} 成交 ${fullyFilled ? "✓" : "(部分)"} @${p.price} x${buySize}${buyBtcStr}`);
         for (let si = 0; si < 3; si++) {
           const ok = await client.syncTokenBalance(p.tokenId);
           if (ok) break;

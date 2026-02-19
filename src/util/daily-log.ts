@@ -77,9 +77,13 @@ export function logTrade(params: {
   price: number;
   size: number;
   reason?: string;
+  btcTarget?: number;
+  btcNow?: number;
 }): void {
-  const { slug, side, action, price, size, reason = "" } = params;
-  logDaily(`TRADE ${action} slug=${slug} side=${side.toUpperCase()} price=${price} size=${size}${reason ? ` reason=${reason}` : ""}`);
+  const { slug, side, action, price, size, reason = "", btcTarget, btcNow } = params;
+  const btcStr =
+    btcTarget != null && btcNow != null ? ` btcTarget=${btcTarget.toFixed(2)} btcNow=${btcNow.toFixed(2)}` : "";
+  logDaily(`TRADE ${action} slug=${slug} side=${side.toUpperCase()} price=${price} size=${size}${reason ? ` reason=${reason}` : ""}${btcStr}`);
 }
 
 /**
@@ -92,8 +96,14 @@ export function logRoundEnd(params: {
   upAsk: number;
   downBid: number;
   downAsk: number;
+  btcPriceToBeat?: number;
+  btcNow?: number;
 }): void {
-  const { slug, endTime, upBid, upAsk, downBid, downAsk } = params;
+  const { slug, endTime, upBid, upAsk, downBid, downAsk, btcPriceToBeat, btcNow } = params;
   const windowEt = formatEtWindow(endTime);
-  logDaily(`ROUND_END slug=${slug} window=${windowEt} Up_bid=${upBid} Up_ask=${upAsk} Down_bid=${downBid} Down_ask=${downAsk}`);
+  const btcStr =
+    btcPriceToBeat != null && btcNow != null
+      ? ` btcPriceToBeat=${btcPriceToBeat.toFixed(2)} btcNow=${btcNow.toFixed(2)}`
+      : "";
+  logDaily(`ROUND_END slug=${slug} window=${windowEt} Up_bid=${upBid} Up_ask=${upAsk} Down_bid=${downBid} Down_ask=${downAsk}${btcStr}`);
 }
