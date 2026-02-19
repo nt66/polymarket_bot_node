@@ -1,8 +1,15 @@
 import * as fs from "fs";
 import * as path from "path";
-import { getBtc5MinMarketsFast } from "./api/gamma.js";
+import { getAll5MinMarketsFast } from "./api/gamma.js";
 import { getOrderBooks, createPolymarketClient } from "./api/clob.js";
-import { getCurrentBtcPrice, getBtcPriceAtTimestamp } from "./api/btc-price.js";
+import {
+  getCurrentBtcPrice,
+  getCurrentEthPrice,
+  getCurrentSolPrice,
+  getBtcPriceAtTimestamp,
+  getEthPriceAtTimestamp,
+  getSolPriceAtTimestamp,
+} from "./api/btc-price.js";
 import type { GammaMarket, Btc15mResult } from "./api/gamma.js";
 import type { MarketContext } from "./strategies/types.js";
 import { executeSignal } from "./execution/executor.js";
@@ -10,11 +17,42 @@ import { loadConfig } from "./config/index.js";
 import { PositionTracker } from "./risk/position-tracker.js";
 import { logTrade, logRoundEnd } from "./util/daily-log.js";
 
-// === 动态风险控制配置 ===
-const VOLATILITY_WINDOW_SIZE = 40; // 缓存最近约 10-15 秒的价格点
-const BASE_SAFE_GAP = 15;          // 基础价差门槛
-const MOMENTUM_THRESHOLD = 4.5;    // 5秒内的反向脉冲拦截阈值
-const btcPriceHistory: number[] = []; // 价格滑窗
+// === 三盘（BTC / ETH / SOL）动态风险配置 ===
+type Coin = "btc" | "eth" | "sol";
+const VOLATILITY_WINDOW_SIZE = 40;
+
+const COIN_CONFIG: Record<Coin, { baseSafeGap: number; momentumThreshold: number; maxAskDepthUsd: number }> = {
+  btc: { baseSafeGap: 15, momentumThreshold: 4.5, maxAskDepthUsd: 4000 },
+  eth: { baseSafeGap: 1.2, momentumThreshold: 0.4, maxAskDepthUsd: 1500 },
+  sol: { baseSafeGap: 0.15, momentumThreshold: 0.05, maxAskDepthUsd: 600 },
+};
+
+const btcPriceHistory: number[] = [];
+const ethPriceHistory: number[] = [];
+const solPriceHistory: number[] = [];
+
+function getCoinFromSlug(slug: string): Coin | null {
+  if (/^btc-updown-5m-/.test(slug)) return "btc";
+  if (/^eth-updown-5m-/.test(slug)) return "eth";
+  if (/^sol-updown-5m-/.test(slug)) return "sol";
+  return null;
+}
+
+function getPriceHistory(coin: Coin): number[] {
+  switch (coin) {
+    case "btc": return btcPriceHistory;
+    case "eth": return ethPriceHistory;
+    case "sol": return solPriceHistory;
+  }
+}
+
+async function getPriceAtTimestampForCoin(coin: Coin, unixSec: number): Promise<number | null> {
+  switch (coin) {
+    case "btc": return getBtcPriceAtTimestamp(unixSec);
+    case "eth": return getEthPriceAtTimestamp(unixSec);
+    case "sol": return getSolPriceAtTimestamp(unixSec);
+  }
+}
 
 const STOP_FILE = path.join(process.cwd(), ".polymarket-bot-stop");
 
@@ -29,41 +67,45 @@ function clearStopFile(): void {
 }
 
 /**
- * 核心逻辑：计算动态缓冲区
- * 基于最近一段时间的振幅来调整安全距离
+ * 按币种计算动态缓冲区（基础价差 + 近期振幅 60%）
  */
-function getDynamicBuffer(): number {
-  if (btcPriceHistory.length < 10) return BASE_SAFE_GAP;
-  const max = Math.max(...btcPriceHistory);
-  const min = Math.min(...btcPriceHistory);
-  const amplitude = max - min;
-  // 动态门槛 = 基础 15u + 近期振幅的 60%。若近期剧烈波动，门槛会迅速飙升
-  return BASE_SAFE_GAP + (amplitude * 0.6);
+function getDynamicBuffer(coin: Coin): number {
+  const hist = getPriceHistory(coin);
+  const base = COIN_CONFIG[coin].baseSafeGap;
+  if (hist.length < 10) return base;
+  const max = Math.max(...hist);
+  const min = Math.min(...hist);
+  return base + (max - min) * 0.6;
 }
 
 /**
- * 动态时间风险配置：剩余时间越短，要求的价差门槛不同
- * 3分钟以上极高价差，1分钟内用动态波动率
+ * 按币种的动态时间风险：剩余时间越短要求价差不同，SOL 预留更多缓冲（比例更保守）
  */
-function getRequiredGapByTime(secsLeft: number, vBuffer: number): number {
-  if (secsLeft > 180) return 110; // 3分钟以上，要求极高价差 (110u+)
-  if (secsLeft > 120) return 80;  // 2-3分钟，要求 80u 价差
-  if (secsLeft > 60) return 45;   // 1-2分钟，要求 45u 价差
-  // 1分钟以内，使用动态波动率逻辑 (BASE_SAFE_GAP 15 + 波动修正)
-  return Math.max(25, vBuffer);
+function getRequiredGapByTime(secsLeft: number, vBuffer: number, coin: Coin): number {
+  const base = COIN_CONFIG[coin].baseSafeGap;
+  const scale = base / 15; // BTC=1, ETH≈0.08, SOL≈0.01
+  const tier3m = 110 * scale;
+  const tier2m = 80 * scale;
+  const tier1m = 45 * scale;
+  const minFloor = base * (25 / 15); // 与 BTC 25u 同比例
+
+  if (secsLeft > 180) return tier3m;
+  if (secsLeft > 120) return tier2m;
+  if (secsLeft > 60) return tier1m;
+  return Math.max(minFloor, vBuffer);
 }
 
 /**
- * 核心逻辑：趋势拦截
- * 防止在 BTC 快速下跌时买入 UP，或快速上涨时买入 DOWN
+ * 按币种趋势拦截：防止暴跌时买 UP、暴涨时买 DOWN
  */
-function isMomentumDangerous(side: "up" | "down"): boolean {
-  if (btcPriceHistory.length < 10) return false;
-  const recent = btcPriceHistory.slice(-8); // 取最近几秒
+function isMomentumDangerous(side: "up" | "down", coin: Coin): boolean {
+  const hist = getPriceHistory(coin);
+  const threshold = COIN_CONFIG[coin].momentumThreshold;
+  if (hist.length < 10) return false;
+  const recent = hist.slice(-8);
   const delta = recent[recent.length - 1] - recent[0];
-
-  if (side === "up" && delta < -MOMENTUM_THRESHOLD) return true;  // 正在暴跌，禁买 UP
-  if (side === "down" && delta > MOMENTUM_THRESHOLD) return true; // 正在暴涨，禁买 DOWN
+  if (side === "up" && delta < -threshold) return true;
+  if (side === "down" && delta > threshold) return true;
   return false;
 }
 
@@ -122,7 +164,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
   clearStopFile();
 
-  console.log("=== 98概率买入 盈利及时卖出 (仅 BTC 5min) ===");
+  console.log("=== 98概率买入 盈利及时卖出 (三盘 BTC/ETH/SOL 5min) ===");
   console.log(`挂单价=${config.buy98OrderPrices.join(",")} | 每次 ${config.buy98OrderSizeShares} shares | 盈利即卖`);
   console.log("---");
 
@@ -163,7 +205,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
   async function refreshMarkets(): Promise<void> {
     try {
-      const result = await getBtc5MinMarketsFast();
+      const result = await getAll5MinMarketsFast();
       marketResult = result;
       if (result.inWindow.length > 0) {
         const info = result.inWindow.map((m) => {
@@ -287,11 +329,23 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
     if (activeMarkets.length === 0) return;
 
-    // --- 实时更新 BTC 价格历史 ---
-    const currentBtc = await getCurrentBtcPrice();
+    // --- 实时更新三盘价格历史（用于动态价差与动量拦截）---
+    const [currentBtc, currentEth, currentSol] = await Promise.all([
+      getCurrentBtcPrice(),
+      getCurrentEthPrice(),
+      getCurrentSolPrice(),
+    ]);
     if (currentBtc != null) {
       btcPriceHistory.push(currentBtc);
       if (btcPriceHistory.length > VOLATILITY_WINDOW_SIZE) btcPriceHistory.shift();
+    }
+    if (currentEth != null) {
+      ethPriceHistory.push(currentEth);
+      if (ethPriceHistory.length > VOLATILITY_WINDOW_SIZE) ethPriceHistory.shift();
+    }
+    if (currentSol != null) {
+      solPriceHistory.push(currentSol);
+      if (solPriceHistory.length > VOLATILITY_WINDOW_SIZE) solPriceHistory.shift();
     }
 
     // 获取订单簿
@@ -327,10 +381,12 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         continue;
       }
       if (!activeSlugs.has(p.slug)) {
-        const roundBtcTarget = roundEndBtcPriceToBeat.get(p.slug);
-        const roundBtcStr =
-          roundBtcTarget != null && currentBtc != null
-            ? ` | BTC 目标=${roundBtcTarget.toFixed(2)} 当前=${currentBtc.toFixed(2)}`
+        const roundTarget = roundEndBtcPriceToBeat.get(p.slug);
+        const roundCoin = getCoinFromSlug(p.slug);
+        const roundCur = roundCoin === "btc" ? currentBtc : roundCoin === "eth" ? currentEth : currentSol;
+        const roundPriceStr =
+          roundTarget != null && roundCur != null && roundCoin != null
+            ? ` | ${roundCoin.toUpperCase()} 目标=${roundTarget.toFixed(2)} 当前=${roundCur.toFixed(2)}`
             : "";
         if (!roundEndLogged.has(p.slug)) {
           const snap = lastSnapshotBySlug.get(p.slug);
@@ -342,8 +398,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
               upAsk: snap.upAsk,
               downBid: snap.downBid,
               downAsk: snap.downAsk,
-              btcPriceToBeat: roundBtcTarget,
-              btcNow: currentBtc ?? undefined,
+              btcPriceToBeat: roundTarget ?? undefined,
+              btcNow: roundCur ?? undefined,
             });
             lastSnapshotBySlug.delete(p.slug);
           }
@@ -351,7 +407,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         }
         await client.cancelOrder(p.orderId);
         pendingByKey.delete(k);
-        console.log(`[98C] 轮结束，取消挂单 ${p.side.toUpperCase()} @${p.price} ${p.slug.slice(0, 20)}…${roundBtcStr}`);
+        console.log(`[98C] 轮结束，取消挂单 ${p.side.toUpperCase()} @${p.price} ${p.slug.slice(0, 20)}…${roundPriceStr}`);
       }
     }
 
@@ -366,6 +422,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         books.get(noToken.token_id) ?? null
       );
       const slug = market.slug || "";
+      const coin = getCoinFromSlug(slug);
+      const currentPrice = coin != null ? (coin === "btc" ? currentBtc : coin === "eth" ? currentEth : currentSol) : null;
       const currentBids = new Map<string, { price: number; size: number }>();
       if (ctx.yesBook?.bids?.[0]) {
         currentBids.set(ctx.yesTokenId, {
@@ -400,12 +458,12 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         const isSuperProfit = sig.price >= 0.995;
         if (isSuperProfit) sig.reason = "[Profit-Protect] 触及 0.995 高位，强制落袋";
 
-        const btcTarget = priceToBeatBySlug.get(slug);
-        const btcStr =
-          btcTarget != null && currentBtc != null
-            ? ` | BTC 目标=${btcTarget.toFixed(2)} 当前=${currentBtc.toFixed(2)}`
+        const priceTarget = priceToBeatBySlug.get(slug);
+        const priceStr =
+          priceTarget != null && currentPrice != null && coin != null
+            ? ` | ${coin.toUpperCase()} 目标=${priceTarget.toFixed(2)} 当前=${currentPrice.toFixed(2)}`
             : "";
-        console.log(`[EXIT] ${sig.reason}${btcStr}`);
+        console.log(`[EXIT] ${sig.reason}${priceStr}`);
 
         if (pos) {
           const shortReason = sig.reason.includes("止盈") ? "止盈" : sig.reason.includes("止损") ? "止损" : "EXIT";
@@ -416,8 +474,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
             price: sig.price,
             size: sig.size,
             reason: shortReason,
-            btcTarget: btcTarget ?? undefined,
-            btcNow: currentBtc ?? undefined,
+            btcTarget: priceTarget ?? undefined,
+            btcNow: currentPrice ?? undefined,
           });
         }
 
@@ -449,31 +507,32 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       // 只做 98/99 两档，97 不买
       const orderPrices = config.buy98OrderPrices.filter((p) => p >= 0.98);
 
-      // 时间加权价差门槛 + Price to Beat
-      const vBuffer = getDynamicBuffer();
-      const requiredGap = getRequiredGapByTime(secsLeft, vBuffer);
-      const slotStartMatch = slug.match(/btc-updown-5m-(\d+)/);
+      // 按币种：时间加权价差门槛 + Price to Beat
+      if (coin == null) continue;
+      const vBuffer = getDynamicBuffer(coin);
+      const requiredGap = getRequiredGapByTime(secsLeft, vBuffer, coin);
+      const slotStartMatch = slug.match(/(?:btc|eth|sol)-updown-5m-(\d+)/);
       const slotStart = slotStartMatch ? parseInt(slotStartMatch[1], 10) : 0;
       let priceToBeat = slotStart ? priceToBeatBySlug.get(slug) : undefined;
       if (slotStart && priceToBeat == null) {
-        const p = await getBtcPriceAtTimestamp(slotStart);
+        const p = await getPriceAtTimestampForCoin(coin, slotStart);
         if (p != null) {
           priceToBeatBySlug.set(slug, p);
           priceToBeat = p;
         }
       }
-      if (priceToBeat != null && currentBtc != null) {
-        const actualGap = Math.abs(currentBtc - priceToBeat);
+      if (priceToBeat != null && currentPrice != null) {
+        const actualGap = Math.abs(currentPrice - priceToBeat);
         if (actualGap < requiredGap) {
           if (nowMs % 4000 < 300) {
-            console.log(`[Time-Guard] 拦截: 剩余${Math.round(secsLeft)}s 要求价差>${requiredGap}u, 当前${actualGap.toFixed(2)}u`);
+            console.log(`[Time-Guard] ${coin.toUpperCase()} 拦截: 剩余${Math.round(secsLeft)}s 要求价差>${requiredGap.toFixed(2)}u, 当前${actualGap.toFixed(2)}u`);
           }
           continue;
         }
       }
 
-      // 订单簿深度过滤（防巨单诱多）：99c 上超过 5000 刀卖单不吃
-      const isTooDeep = (askSizeDollars: number) => askSizeDollars > 5000;
+      // 订单簿深度过滤（防巨单诱多）：按币种设限，SOL/ETH 盘口通常更薄
+      const isTooDeep = (askSizeDollars: number) => askSizeDollars > COIN_CONFIG[coin].maxAskDepthUsd;
       const upAskSize =
         ctx.yesBook?.asks?.[0]
           ? parseFloat(ctx.yesBook.asks[0].size) * parseFloat(ctx.yesBook.asks[0].price)
@@ -521,9 +580,9 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         }
 
         tracker.recordBuy(p.tokenId, p.side, p.price, buySize, slug);
-        const buyBtcStr =
-          priceToBeat != null && currentBtc != null
-            ? ` | BTC 目标=${priceToBeat.toFixed(2)} 当前=${currentBtc.toFixed(2)}`
+        const buyPriceStr =
+          priceToBeat != null && currentPrice != null
+            ? ` | ${coin.toUpperCase()} 目标=${priceToBeat.toFixed(2)} 当前=${currentPrice.toFixed(2)}`
             : "";
         logTrade({
           slug,
@@ -532,9 +591,9 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           price: p.price,
           size: buySize,
           btcTarget: priceToBeat ?? undefined,
-          btcNow: currentBtc ?? undefined,
+          btcNow: currentPrice ?? undefined,
         });
-        console.log(`[98C] ${p.side.toUpperCase()} 成交 ${fullyFilled ? "✓" : "(部分)"} @${p.price} x${buySize}${buyBtcStr}`);
+        console.log(`[98C] ${p.side.toUpperCase()} 成交 ${fullyFilled ? "✓" : "(部分)"} @${p.price} x${buySize}${buyPriceStr}`);
         for (let si = 0; si < 3; si++) {
           const ok = await client.syncTokenBalance(p.tokenId);
           if (ok) break;
@@ -563,8 +622,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
       // 98c 或 99c：满足价格带即挂单（含趋势拦截 + 深度过滤）
       if (upPr != null) {
-        if (isMomentumDangerous("up") || isTooDeep(upAskSize)) {
-          console.log(`[Risk] 趋势下杀或深度过大，取消 UP 挂单`);
+        if (isMomentumDangerous("up", coin) || isTooDeep(upAskSize)) {
+          console.log(`[Risk] ${coin.toUpperCase()} 趋势下杀或深度过大，取消 UP 挂单`);
           continue;
         }
         const cost = upPr * size;
@@ -586,8 +645,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         continue;
       }
       if (downPr != null) {
-        if (isMomentumDangerous("down") || isTooDeep(downAskSize)) {
-          console.log(`[Risk] 趋势上涨或深度过大，取消 DOWN 挂单`);
+        if (isMomentumDangerous("down", coin) || isTooDeep(downAskSize)) {
+          console.log(`[Risk] ${coin.toUpperCase()} 趋势上涨或深度过大，取消 DOWN 挂单`);
           continue;
         }
         const cost = downPr * size;

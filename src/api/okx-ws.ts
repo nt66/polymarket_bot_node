@@ -7,6 +7,19 @@ import WebSocket from "ws";
 const OKX_WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public";
 const OKX_REST_TICKER = "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT";
 
+/** 通用 REST 拉取现货价格（BTC/ETH/SOL 等） */
+export async function fetchSpotPriceHttp(instId: string): Promise<number | null> {
+  try {
+    const res = await fetch(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(instId)}`);
+    if (!res.ok) return null;
+    const json = (await res.json()) as { data?: Array<{ last?: string }> };
+    const last = parseFloat(json.data?.[0]?.last ?? "");
+    return Number.isFinite(last) ? last : null;
+  } catch {
+    return null;
+  }
+}
+
 export type BtcPriceHandler = (price: number, ts: number) => void;
 
 /**
