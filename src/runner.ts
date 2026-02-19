@@ -42,6 +42,18 @@ function getDynamicBuffer(): number {
 }
 
 /**
+ * 动态时间风险配置：剩余时间越短，要求的价差门槛不同
+ * 3分钟以上极高价差，1分钟内用动态波动率
+ */
+function getRequiredGapByTime(secsLeft: number, vBuffer: number): number {
+  if (secsLeft > 180) return 110; // 3分钟以上，要求极高价差 (110u+)
+  if (secsLeft > 120) return 80;  // 2-3分钟，要求 80u 价差
+  if (secsLeft > 60) return 45;   // 1-2分钟，要求 45u 价差
+  // 1分钟以内，使用动态波动率逻辑 (BASE_SAFE_GAP 15 + 波动修正)
+  return Math.max(25, vBuffer);
+}
+
+/**
  * 核心逻辑：趋势拦截
  * 防止在 BTC 快速下跌时买入 UP，或快速上涨时买入 DOWN
  */
@@ -384,6 +396,10 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           continue;
         }
 
+        // 强制止盈：98c 买入后盘口插针到 0.995 时立刻卖出，不承担反杀风险
+        const isSuperProfit = sig.price >= 0.995;
+        if (isSuperProfit) sig.reason = "[Profit-Protect] 触及 0.995 高位，强制落袋";
+
         const btcTarget = priceToBeatBySlug.get(slug);
         const btcStr =
           btcTarget != null && currentBtc != null
@@ -433,8 +449,9 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       // 只做 98/99 两档，97 不买
       const orderPrices = config.buy98OrderPrices.filter((p) => p >= 0.98);
 
-      // 动态安全垫 + 价差过滤
-      const dynamicBuffer = getDynamicBuffer();
+      // 时间加权价差门槛 + Price to Beat
+      const vBuffer = getDynamicBuffer();
+      const requiredGap = getRequiredGapByTime(secsLeft, vBuffer);
       const slotStartMatch = slug.match(/btc-updown-5m-(\d+)/);
       const slotStart = slotStartMatch ? parseInt(slotStartMatch[1], 10) : 0;
       let priceToBeat = slotStart ? priceToBeatBySlug.get(slug) : undefined;
@@ -445,16 +462,26 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           priceToBeat = p;
         }
       }
-      // 增强型价差过滤：价差 < 动态门槛则拦截
       if (priceToBeat != null && currentBtc != null) {
         const actualGap = Math.abs(currentBtc - priceToBeat);
-        if (actualGap < dynamicBuffer) {
-          if (nowMs % 2000 < 300) {
-            console.log(`[Risk-Control] 价差 ${actualGap.toFixed(2)}u < 动态要求 ${dynamicBuffer.toFixed(2)}u，拦截 98c 挂单`);
+        if (actualGap < requiredGap) {
+          if (nowMs % 4000 < 300) {
+            console.log(`[Time-Guard] 拦截: 剩余${Math.round(secsLeft)}s 要求价差>${requiredGap}u, 当前${actualGap.toFixed(2)}u`);
           }
           continue;
         }
       }
+
+      // 订单簿深度过滤（防巨单诱多）：99c 上超过 5000 刀卖单不吃
+      const isTooDeep = (askSizeDollars: number) => askSizeDollars > 5000;
+      const upAskSize =
+        ctx.yesBook?.asks?.[0]
+          ? parseFloat(ctx.yesBook.asks[0].size) * parseFloat(ctx.yesBook.asks[0].price)
+          : 0;
+      const downAskSize =
+        ctx.noBook?.asks?.[0]
+          ? parseFloat(ctx.noBook.asks[0].size) * parseFloat(ctx.noBook.asks[0].price)
+          : 0;
       const orderShares = Math.max(5, Math.floor(config.buy98OrderSizeShares));
       const tickSize = parseFloat(ctx.tickSize || "0.01");
       const roundToTick = (n: number) => Number((Math.floor(n / tickSize) * tickSize).toFixed(4));
@@ -534,10 +561,10 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         console.log(`[98C] ${u} | ${d}`);
       }
 
-      // 98c 或 99c：满足价格带即挂单（含趋势拦截）
+      // 98c 或 99c：满足价格带即挂单（含趋势拦截 + 深度过滤）
       if (upPr != null) {
-        if (isMomentumDangerous("up")) {
-          console.log(`[Anti-Flip] 趋势拦截：BTC 正在下杀，取消 UP 挂单`);
+        if (isMomentumDangerous("up") || isTooDeep(upAskSize)) {
+          console.log(`[Risk] 趋势下杀或深度过大，取消 UP 挂单`);
           continue;
         }
         const cost = upPr * size;
@@ -559,8 +586,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         continue;
       }
       if (downPr != null) {
-        if (isMomentumDangerous("down")) {
-          console.log(`[Anti-Flip] 趋势拦截：BTC 正在上抽，取消 DOWN 挂单`);
+        if (isMomentumDangerous("down") || isTooDeep(downAskSize)) {
+          console.log(`[Risk] 趋势上涨或深度过大，取消 DOWN 挂单`);
           continue;
         }
         const cost = downPr * size;
