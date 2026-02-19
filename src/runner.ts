@@ -1,8 +1,3 @@
-/**
- * 98 概率买入、盈利及时卖出（仅 BTC 5min）
- * 挂单价从 .env 的 BUY98_ORDER_PRICE 读取。
- */
-
 import * as fs from "fs";
 import * as path from "path";
 import { getBtc5MinMarketsFast } from "./api/gamma.js";
@@ -15,6 +10,12 @@ import { loadConfig } from "./config/index.js";
 import { PositionTracker } from "./risk/position-tracker.js";
 import { logTrade, logRoundEnd } from "./util/daily-log.js";
 
+// === 动态风险控制配置 ===
+const VOLATILITY_WINDOW_SIZE = 40; // 缓存最近约 10-15 秒的价格点
+const BASE_SAFE_GAP = 15;          // 基础价差门槛
+const MOMENTUM_THRESHOLD = 4.5;    // 5秒内的反向脉冲拦截阈值
+const btcPriceHistory: number[] = []; // 价格滑窗
+
 const STOP_FILE = path.join(process.cwd(), ".polymarket-bot-stop");
 
 export function isStopRequested(): boolean {
@@ -25,6 +26,33 @@ export function requestStop(): void {
 }
 function clearStopFile(): void {
   try { if (fs.existsSync(STOP_FILE)) fs.unlinkSync(STOP_FILE); } catch { }
+}
+
+/**
+ * 核心逻辑：计算动态缓冲区
+ * 基于最近一段时间的振幅来调整安全距离
+ */
+function getDynamicBuffer(): number {
+  if (btcPriceHistory.length < 10) return BASE_SAFE_GAP;
+  const max = Math.max(...btcPriceHistory);
+  const min = Math.min(...btcPriceHistory);
+  const amplitude = max - min;
+  // 动态门槛 = 基础 15u + 近期振幅的 60%。若近期剧烈波动，门槛会迅速飙升
+  return BASE_SAFE_GAP + (amplitude * 0.6);
+}
+
+/**
+ * 核心逻辑：趋势拦截
+ * 防止在 BTC 快速下跌时买入 UP，或快速上涨时买入 DOWN
+ */
+function isMomentumDangerous(side: "up" | "down"): boolean {
+  if (btcPriceHistory.length < 10) return false;
+  const recent = btcPriceHistory.slice(-8); // 取最近几秒
+  const delta = recent[recent.length - 1] - recent[0];
+
+  if (side === "up" && delta < -MOMENTUM_THRESHOLD) return true;  // 正在暴跌，禁买 UP
+  if (side === "down" && delta > MOMENTUM_THRESHOLD) return true; // 正在暴涨，禁买 DOWN
+  return false;
 }
 
 function findYesToken(market: GammaMarket) {
@@ -61,14 +89,11 @@ export interface RunnerOptions {
 
 export async function run(options: RunnerOptions = {}): Promise<void> {
   const config = loadConfig();
-  // 盘口在 5min 末期可能“闪现”0.98，轮询过慢会错过
   const FAST_POLL_MS = options.pollIntervalMs ?? 250;
-  // 即使“当前无 inWindow 市场”，也要高频刷新以免错过开盘瞬间
   const IDLE_POLL_MS = FAST_POLL_MS;
   const marketRefreshMs = options.marketRefreshMs ?? 30000;
 
   // 98 策略要求「有盈利立刻卖出」：不做最小持仓时间限制
-  // 代币未结算的情况由 attemptSell 内部的余额检查 + sync + 等待兜底
   const MIN_HOLD_BEFORE_SELL_MS = 0;
   const LOSS_COOLDOWN_MS = 90_000;         // 止损后冷却期
 
@@ -111,15 +136,11 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   const lastSnapshotBySlug = new Map<string, { upBid: number; upAsk: number; downBid: number; downAsk: number; endTime: string }>();
   // Price to beat 缓存（slug -> 该轮开始时 BTC 价格，美元），用于最后 10 秒价差过滤
   const priceToBeatBySlug = new Map<string, number>();
-
-  // === 未成交挂单：本轮挂着，下一轮 5min 再取消（支持同轮 0.98 + 0.99 两档同时挂）===
-  // key: `${slug}:${side}:${price}`
   const pendingByKey = new Map<
     string,
     { orderId: string; tokenId: string; side: "up" | "down"; size: number; price: number; slug: string; placedAt: number; marketEndMs: number }
   >();
 
-  // 98 策略：只止盈卖出，不设价格/时间止损（跌了或拿久了都不主动卖，只等止盈或到期结算）
   const tracker = new PositionTracker({
     profitTarget: 0.01,
     stopLoss: 999,   // 不止损
@@ -254,6 +275,13 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
     if (activeMarkets.length === 0) return;
 
+    // --- 实时更新 BTC 价格历史 ---
+    const currentBtc = await getCurrentBtcPrice();
+    if (currentBtc != null) {
+      btcPriceHistory.push(currentBtc);
+      if (btcPriceHistory.length > VOLATILITY_WINDOW_SIZE) btcPriceHistory.shift();
+    }
+
     // 获取订单簿
     const tokenIds = activeMarkets.flatMap((m) => m.tokens?.map((t) => t.token_id) ?? []).filter(Boolean);
     let books: Map<string, any>;
@@ -369,8 +397,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       // 只做 98/99 两档，97 不买
       const orderPrices = config.buy98OrderPrices.filter((p) => p >= 0.98);
 
-      // 价格差过滤：若 BTC 当前价与 Price to Beat 之差的绝对值 < 15 美元，本拍不挂单（与 0.98/0.99 条件同级）
-      const DOLLAR_DIFF_RISK = 15;
+      // 动态安全垫 + 价差过滤
+      const dynamicBuffer = getDynamicBuffer();
       const slotStartMatch = slug.match(/btc-updown-5m-(\d+)/);
       const slotStart = slotStartMatch ? parseInt(slotStartMatch[1], 10) : 0;
       let priceToBeat = slotStart ? priceToBeatBySlug.get(slug) : undefined;
@@ -381,15 +409,21 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           priceToBeat = p;
         }
       }
-      const currentBtc = await getCurrentBtcPrice();
-      if (priceToBeat != null && currentBtc != null && Math.abs(currentBtc - priceToBeat) < DOLLAR_DIFF_RISK) {
-        console.log("[98C] BTC 价差不足 " + DOLLAR_DIFF_RISK + " 美元，本拍不挂单（|" + currentBtc.toFixed(2) + " - " + priceToBeat.toFixed(2) + "| < " + DOLLAR_DIFF_RISK + "）");
-        continue;
+      // 增强型价差过滤：价差 < 动态门槛则拦截
+      if (priceToBeat != null && currentBtc != null) {
+        const actualGap = Math.abs(currentBtc - priceToBeat);
+        if (actualGap < dynamicBuffer) {
+          if (nowMs % 2000 < 300) {
+            console.log(`[Risk-Control] 价差 ${actualGap.toFixed(2)}u < 动态要求 ${dynamicBuffer.toFixed(2)}u，拦截 98c 挂单`);
+          }
+          continue;
+        }
       }
       const orderShares = Math.max(5, Math.floor(config.buy98OrderSizeShares));
       const tickSize = parseFloat(ctx.tickSize || "0.01");
       const roundToTick = (n: number) => Number((Math.floor(n / tickSize) * tickSize).toFixed(4));
       const roundSize = (s: number) => Math.max(0.01, roundToTick(s));
+
       // 用“价格带”触发，避免浮点或四舍五入漏掉 98/99（两把都没触发多半是这里太严）
       const inBand = (p: number, low: number, high: number) => Number.isFinite(p) && p >= low && p <= high;
       const pickPrice = (ask: number, bid: number): number | null => {
@@ -452,8 +486,12 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         console.log(`[98C] ${u} | ${d}`);
       }
 
-      // 98c 或 99c：满足价格带即挂单
+      // 98c 或 99c：满足价格带即挂单（含趋势拦截）
       if (upPr != null) {
+        if (isMomentumDangerous("up")) {
+          console.log(`[Anti-Flip] 趋势拦截：BTC 正在下杀，取消 UP 挂单`);
+          continue;
+        }
         const cost = upPr * size;
         const key = `${slug}:up:${upPr}`;
         if (pendingByKey.has(key)) continue;
@@ -473,6 +511,10 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         continue;
       }
       if (downPr != null) {
+        if (isMomentumDangerous("down")) {
+          console.log(`[Anti-Flip] 趋势拦截：BTC 正在上抽，取消 DOWN 挂单`);
+          continue;
+        }
         const cost = downPr * size;
         const key = `${slug}:down:${downPr}`;
         if (pendingByKey.has(key)) continue;
