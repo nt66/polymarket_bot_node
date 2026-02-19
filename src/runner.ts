@@ -297,6 +297,15 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
     const roundEndLogged = new Set<string>();
     for (const [k, p] of pendingByKey.entries()) {
+      // 超时撤单
+      // 如果挂单超过 10 秒没成交，或者离结束只剩 8 秒了，强制撤单保平安
+      const currentSecsLeft = (p.marketEndMs - Date.now()) / 1000;
+      if (currentSecsLeft < 8) {
+        await client.cancelOrder(p.orderId);
+        pendingByKey.delete(k);
+        console.log(`[Safety] 距离结束太近，撤销未成交挂单: ${p.slug}`);
+        continue;
+      }
       if (!activeSlugs.has(p.slug)) {
         if (!roundEndLogged.has(p.slug)) {
           const snap = lastSnapshotBySlug.get(p.slug);
@@ -330,8 +339,6 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         books.get(noToken.token_id) ?? null
       );
       const slug = market.slug || "";
-
-      // 构建 bids map
       const currentBids = new Map<string, { price: number; size: number }>();
       if (ctx.yesBook?.bids?.[0]) {
         currentBids.set(ctx.yesTokenId, {
@@ -540,6 +547,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   process.on("unhandledRejection", (err) => {
     console.error("[WARN] Unhandled:", err instanceof Error ? err.message : err);
   });
+
   process.on("uncaughtException", (err) => {
     console.error("[WARN] Uncaught:", err.message);
   });
