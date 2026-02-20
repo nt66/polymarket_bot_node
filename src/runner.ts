@@ -25,7 +25,7 @@ const VOLATILITY_WINDOW_SIZE = 40;
 const COIN_CONFIG: Record<Coin, { baseSafeGap: number; momentumThreshold: number; maxAskDepthUsd: number }> = {
   btc: { baseSafeGap: 15, momentumThreshold: 4.5, maxAskDepthUsd: 4000 },
   eth: { baseSafeGap: 1.2, momentumThreshold: 0.4, maxAskDepthUsd: 1500 },
-  sol: { baseSafeGap: 0.30, momentumThreshold: 0.03, maxAskDepthUsd: 500 },
+  sol: { baseSafeGap: 0.22, momentumThreshold: 0.04, maxAskDepthUsd: 600 },
 };
 
 const btcPriceHistory: number[] = [];
