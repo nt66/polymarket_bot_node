@@ -17,6 +17,10 @@ export interface EnvConfig {
   buy98OrderMaxPositionPerMarket: number;
   /** 允许挂单的价格列表（如 [0.99, 0.98]） */
   buy98OrderPrices: number[];
+  /** Telegram 推送：Bot Token（不填则不发） */
+  tgBotToken?: string;
+  /** Telegram 推送：Chat ID（不填则不发） */
+  tgChatId?: string;
 }
 
 const defaultConfig: EnvConfig = {
@@ -58,6 +62,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     buy98OrderMaxPositionPerMarket: parseNum(env.BUY98_MAX_POSITION_PER_MARKET, defaultConfig.buy98OrderMaxPositionPerMarket),
     // 新：逗号分隔，如 "0.98,0.99"；兼容旧 BUY98_ORDER_PRICE
     buy98OrderPrices: parseNumList(env.BUY98_ORDER_PRICES ?? env.BUY98_ORDER_PRICE, defaultConfig.buy98OrderPrices),
+    tgBotToken: env.TG_BOT_TOKEN?.trim() || undefined,
+    tgChatId: env.TG_CHAT_ID?.trim() || undefined,
   };
 }
 

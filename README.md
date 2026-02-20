@@ -31,6 +31,7 @@ src/
 - `BUY98_ORDER_PRICES`：允许挂单的价格，逗号分隔，如 `0.98,0.99`
 - `BUY98_ORDER_SIZE_SHARES`：每次买入张数，如 `50`
 - `BUY98_MAX_POSITION_PER_MARKET`：单市场最大持仓金额（美元），如 `150`
+- **Telegram 盈亏推送**（可选）：`TG_BOT_TOKEN`、`TG_CHAT_ID` 填好后，每次止盈/止损会推送到 TG
 
 ## 命令（本地直接跑）
 

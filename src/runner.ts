@@ -16,6 +16,7 @@ import { executeSignal } from "./execution/executor.js";
 import { loadConfig } from "./config/index.js";
 import { PositionTracker } from "./risk/position-tracker.js";
 import { logTrade, logRoundEnd } from "./util/daily-log.js";
+import { notifyPnL } from "./notify/telegram.js";
 
 // === 三盘（BTC / ETH / SOL）动态风险配置 ===
 type Coin = "btc" | "eth" | "sol";
@@ -90,8 +91,8 @@ function getRequiredGapByTime(secsLeft: number, vBuffer: number, coin: Coin): nu
 
   // === 针对 SOL 的硬性补丁 ===
   if (coin === "sol") {
-    if (secsLeft > 180) return 0.8;
-    if (secsLeft > 60) return 0.45;
+    if (secsLeft > 180) return 0.65;
+    if (secsLeft > 60) return 0.35;
     return Math.max(0.35, vBuffer + 0.1);
   }
 
@@ -492,6 +493,21 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
             priceToBeat: priceTarget ?? undefined,
             priceNow: currentPrice ?? undefined,
           });
+          if (shortReason === "止盈" || shortReason === "止损") {
+            const pnlUsd = (sig.price - pos.avgPrice) * sig.size;
+            notifyPnL({
+              botToken: config.tgBotToken,
+              chatId: config.tgChatId,
+              slug: pos.marketSlug,
+              side: pos.side,
+              reason: shortReason,
+              pnlUsd,
+              buyPrice: pos.avgPrice,
+              sellPrice: sig.price,
+              size: sig.size,
+              coin: coin ?? undefined,
+            });
+          }
         }
 
         // 使用增强版卖出函数（检查余额 + sync + 重试）
