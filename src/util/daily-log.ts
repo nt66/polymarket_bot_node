@@ -69,6 +69,7 @@ export function logDaily(line: string): void {
 
 /**
  * 写入一条交易记录（买入/卖出）
+ * 若传入 coin + priceToBeat + priceNow，日志会按币种打出目标价/当前价（与 BTC 同格式）
  */
 export function logTrade(params: {
   slug: string;
@@ -77,17 +78,22 @@ export function logTrade(params: {
   price: number;
   size: number;
   reason?: string;
-  btcTarget?: number;
-  btcNow?: number;
+  /** 币种，用于日志中的目标价/当前价前缀，如 btc / eth / sol */
+  coin?: string;
+  priceToBeat?: number;
+  priceNow?: number;
 }): void {
-  const { slug, side, action, price, size, reason = "", btcTarget, btcNow } = params;
-  const btcStr =
-    btcTarget != null && btcNow != null ? ` btcTarget=${btcTarget.toFixed(2)} btcNow=${btcNow.toFixed(2)}` : "";
-  logDaily(`TRADE ${action} slug=${slug} side=${side.toUpperCase()} price=${price} size=${size}${reason ? ` reason=${reason}` : ""}${btcStr}`);
+  const { slug, side, action, price, size, reason = "", coin, priceToBeat, priceNow } = params;
+  const priceStr =
+    coin != null && priceToBeat != null && priceNow != null
+      ? ` ${coin}Target=${priceToBeat.toFixed(2)} ${coin}Now=${priceNow.toFixed(2)}`
+      : "";
+  logDaily(`TRADE ${action} slug=${slug} side=${side.toUpperCase()} price=${price} size=${size}${reason ? ` reason=${reason}` : ""}${priceStr}`);
 }
 
 /**
  * 写入一轮结束：市场结束时的 Up/Down 盘口（最后一笔 snapshot）
+ * 若传入 coin，按币种打出目标价/当前价（与 TRADE 一致）
  */
 export function logRoundEnd(params: {
   slug: string;
@@ -96,14 +102,15 @@ export function logRoundEnd(params: {
   upAsk: number;
   downBid: number;
   downAsk: number;
-  btcPriceToBeat?: number;
-  btcNow?: number;
+  coin?: string;
+  priceToBeat?: number;
+  priceNow?: number;
 }): void {
-  const { slug, endTime, upBid, upAsk, downBid, downAsk, btcPriceToBeat, btcNow } = params;
+  const { slug, endTime, upBid, upAsk, downBid, downAsk, coin, priceToBeat, priceNow } = params;
   const windowEt = formatEtWindow(endTime);
-  const btcStr =
-    btcPriceToBeat != null && btcNow != null
-      ? ` btcPriceToBeat=${btcPriceToBeat.toFixed(2)} btcNow=${btcNow.toFixed(2)}`
+  const priceStr =
+    coin != null && priceToBeat != null && priceNow != null
+      ? ` ${coin}PriceToBeat=${priceToBeat.toFixed(2)} ${coin}Now=${priceNow.toFixed(2)}`
       : "";
-  logDaily(`ROUND_END slug=${slug} window=${windowEt} Up_bid=${upBid} Up_ask=${upAsk} Down_bid=${downBid} Down_ask=${downAsk}${btcStr}`);
+  logDaily(`ROUND_END slug=${slug} window=${windowEt} Up_bid=${upBid} Up_ask=${upAsk} Down_bid=${downBid} Down_ask=${downAsk}${priceStr}`);
 }

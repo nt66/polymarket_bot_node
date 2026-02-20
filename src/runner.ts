@@ -21,16 +21,18 @@ import { logTrade, logRoundEnd } from "./util/daily-log.js";
 type Coin = "btc" | "eth" | "sol";
 const VOLATILITY_WINDOW_SIZE = 40;
 
+// 按币种：基础安全价差 + 动量拦截门槛 + 盘口深度限制
 const COIN_CONFIG: Record<Coin, { baseSafeGap: number; momentumThreshold: number; maxAskDepthUsd: number }> = {
   btc: { baseSafeGap: 15, momentumThreshold: 4.5, maxAskDepthUsd: 4000 },
   eth: { baseSafeGap: 1.2, momentumThreshold: 0.4, maxAskDepthUsd: 1500 },
-  sol: { baseSafeGap: 0.15, momentumThreshold: 0.05, maxAskDepthUsd: 600 },
+  sol: { baseSafeGap: 0.30, momentumThreshold: 0.03, maxAskDepthUsd: 500 },
 };
 
 const btcPriceHistory: number[] = [];
 const ethPriceHistory: number[] = [];
 const solPriceHistory: number[] = [];
 
+// 从 slug 中提取币种
 function getCoinFromSlug(slug: string): Coin | null {
   if (/^btc-updown-5m-/.test(slug)) return "btc";
   if (/^eth-updown-5m-/.test(slug)) return "eth";
@@ -38,6 +40,7 @@ function getCoinFromSlug(slug: string): Coin | null {
   return null;
 }
 
+// 获取币种的价格历史
 function getPriceHistory(coin: Coin): number[] {
   switch (coin) {
     case "btc": return btcPriceHistory;
@@ -79,15 +82,24 @@ function getDynamicBuffer(coin: Coin): number {
 }
 
 /**
- * 按币种的动态时间风险：剩余时间越短要求价差不同，SOL 预留更多缓冲（比例更保守）
+ * 按币种的动态时间风险：剩余时间越短要求价差不同；SOL 增加硬性绝对值底线，防止一分钱绝杀
  */
 function getRequiredGapByTime(secsLeft: number, vBuffer: number, coin: Coin): number {
   const base = COIN_CONFIG[coin].baseSafeGap;
-  const scale = base / 15; // BTC=1, ETH≈0.08, SOL≈0.01
+  const scale = base / 15;
+
+  // === 针对 SOL 的硬性补丁 ===
+  if (coin === "sol") {
+    if (secsLeft > 180) return 0.8;
+    if (secsLeft > 60) return 0.45;
+    return Math.max(0.35, vBuffer + 0.1);
+  }
+
+  // === BTC / ETH 保持原逻辑 ===
   const tier3m = 110 * scale;
   const tier2m = 80 * scale;
   const tier1m = 45 * scale;
-  const minFloor = base * (25 / 15); // 与 BTC 25u 同比例
+  const minFloor = base * (25 / 15);
 
   if (secsLeft > 180) return tier3m;
   if (secsLeft > 120) return tier2m;
@@ -112,6 +124,7 @@ function isMomentumDangerous(side: "up" | "down", coin: Coin): boolean {
 function findYesToken(market: GammaMarket) {
   return market.tokens?.find((t) => /^(yes|up)$/i.test(t.outcome)) ?? market.tokens?.[0];
 }
+
 function findNoToken(market: GammaMarket) {
   return market.tokens?.find((t) => /^(no|down)$/i.test(t.outcome)) ?? market.tokens?.[1];
 }
@@ -398,8 +411,9 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
               upAsk: snap.upAsk,
               downBid: snap.downBid,
               downAsk: snap.downAsk,
-              btcPriceToBeat: roundTarget ?? undefined,
-              btcNow: roundCur ?? undefined,
+              coin: getCoinFromSlug(p.slug) ?? undefined,
+              priceToBeat: roundTarget ?? undefined,
+              priceNow: roundCur ?? undefined,
             });
             lastSnapshotBySlug.delete(p.slug);
           }
@@ -474,8 +488,9 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
             price: sig.price,
             size: sig.size,
             reason: shortReason,
-            btcTarget: priceTarget ?? undefined,
-            btcNow: currentPrice ?? undefined,
+            coin: coin ?? undefined,
+            priceToBeat: priceTarget ?? undefined,
+            priceNow: currentPrice ?? undefined,
           });
         }
 
@@ -590,8 +605,9 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           action: "BUY",
           price: p.price,
           size: buySize,
-          btcTarget: priceToBeat ?? undefined,
-          btcNow: currentPrice ?? undefined,
+          coin: coin ?? undefined,
+          priceToBeat: priceToBeat ?? undefined,
+          priceNow: currentPrice ?? undefined,
         });
         console.log(`[98C] ${p.side.toUpperCase()} 成交 ${fullyFilled ? "✓" : "(部分)"} @${p.price} x${buySize}${buyPriceStr}`);
         for (let si = 0; si < 3; si++) {
