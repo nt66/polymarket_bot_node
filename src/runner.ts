@@ -55,16 +55,15 @@ function getPriceHistory(coin: Coin): number[] {
   }
 }
 
-/** V 字防护：价格相对 20 点均值偏离超过阈值视为脉冲末端，易 V 字反杀 */
-const V_GUARD_DEVIATION_USD = 40;
-const V_GUARD_SHORT_LEN = 5;
+/** V 字防护：百分比乖离率，适应不同币种价格基数（BTC 更严苛，ETH/SOL 略宽） */
 const V_GUARD_LONG_LEN = 20;
 
-function isPriceOverextended(currentPrice: number, history: number[]): boolean {
+function isPriceOverextended(currentPrice: number, history: number[], coin: Coin): boolean {
   if (history.length < V_GUARD_LONG_LEN) return false;
-  const shortAvg = history.slice(-V_GUARD_SHORT_LEN).reduce((a, b) => a + b, 0) / V_GUARD_SHORT_LEN;
   const longAvg = history.slice(-V_GUARD_LONG_LEN).reduce((a, b) => a + b, 0) / V_GUARD_LONG_LEN;
-  return Math.abs(currentPrice - longAvg) > V_GUARD_DEVIATION_USD;
+  const deviationPercent = Math.abs(currentPrice - longAvg) / longAvg;
+  const threshold = coin === "btc" ? 0.0006 : 0.0012; // BTC 0.06%，ETH/SOL 0.12%
+  return deviationPercent > threshold;
 }
 
 async function getPriceAtTimestampForCoin(coin: Coin, unixSec: number): Promise<number | null> {
@@ -227,6 +226,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     string,
     { orderId: string; tokenId: string; side: "up" | "down"; size: number; price: number; slug: string; placedAt: number; marketEndMs: number }
   >();
+  /** 入场原子锁：同一 slug 同时只允许一笔挂单指令，防止重复入场 */
+  const entryLockBySlug = new Set<string>();
 
   const tracker = new PositionTracker({
     profitTarget: 0.01,
@@ -261,70 +262,43 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   let lastStatusLog = 0;
   const STATUS_LOG_MS = 30000;
 
-  // === 卖出辅助函数：检查余额 + sync + 卖出，带完整重试 ===
+  // === 卖出辅助：虚拟余额抢跑，不等待链上到账，利用 CLOB 部分成交实现毫秒级止盈 ===
   async function attemptSell(
     tokenId: string,
     sig: { tokenId: string; side: "SELL"; price: number; size: number; reason: string; type: string },
     ctx: MarketContext
   ): Promise<boolean> {
-    // Step 1: 检查实际代币余额
-    let tokenBal = await client!.getTokenBalance(tokenId);
-    if (tokenBal <= 0) {
-      console.log(`[EXIT] 代币余额=0，等待结算... (sync + 5s)`);
-      await client!.syncTokenBalance(tokenId);
-      await new Promise((r) => setTimeout(r, 5000));
-      tokenBal = await client!.getTokenBalance(tokenId);
-      if (tokenBal <= 0) {
-        console.log(`[EXIT] 代币仍未到账(bal=${tokenBal})，再等 5s...`);
-        await new Promise((r) => setTimeout(r, 5000));
-        tokenBal = await client!.getTokenBalance(tokenId);
-      }
-      if (tokenBal <= 0) {
-        console.error(`[EXIT] 代币未到账(bal=${tokenBal})，无法卖出`);
-        return false;
-      }
-    }
-    // 注意：CLOB 返回的 balance 通常是 1e6 精度（例如 19998000 = 19.998 shares）
-    const availableShares = Math.max(0, tokenBal / 1_000_000);
-    const requested = sig.size;
-    const capped = Math.min(requested, availableShares);
-    const cappedRounded = Math.floor(capped * 100) / 100; // 向下取 0.01，避免“余额略小于 20”导致卖出失败
-    const finalSize = Math.max(0.01, cappedRounded);
+    const pos = tracker.getPosition(tokenId);
+    if (!pos) return false;
 
-    console.log(
-      `[EXIT] 代币余额=${tokenBal} (~${availableShares.toFixed(3)} shares)，尝试卖出 size=${requested} -> ${finalSize}`
-    );
+    const virtualSize = pos.size;
+    console.log(`[EXIT-Fast] 触发虚拟止盈: ${sig.reason} | 预估数量: ${virtualSize}`);
 
-    // Step 2: sync token allowance
-    await client!.syncTokenBalance(tokenId);
-    await new Promise((r) => setTimeout(r, 1500));
-
-    // Step 3: 卖出，最多重试 3 次
     let sold = false;
     let sellPrice = sig.price;
-    const sellSigBase = { ...sig, size: finalSize };
 
     for (let attempt = 0; attempt < 3 && !sold; attempt++) {
       try {
-        const sellSig = { ...sellSigBase, price: sellPrice };
-        const r = await executeSignal(client, sellSig as any, ctx.tickSize, ctx.negRisk);
+        const r = await executeSignal(
+          client,
+          { ...sig, size: virtualSize, price: sellPrice } as any,
+          ctx.tickSize,
+          ctx.negRisk
+        );
         if (r.ok) {
-          console.log(`[EXIT] 卖出成功:`, r.orderIds, `@${sellPrice} x${sellSig.size}`);
+          console.log(`[EXIT-Success] 卖单已挂出: ${r.orderIds} @${sellPrice} x${virtualSize}`);
           sold = true;
         } else {
-          console.error(`[EXIT] 卖出失败(${attempt + 1}/3):`, r.error || "unknown");
-          if (r.error && r.error.includes("balance")) {
-            // 余额问题 → 再次 sync + 等待
+          if (r.error?.includes("balance")) {
             await client!.syncTokenBalance(tokenId);
-            await new Promise((r) => setTimeout(r, 4000));
-          } else {
-            sellPrice = Math.max(0.01, sellPrice - 0.01);
-            await new Promise((r) => setTimeout(r, 1000));
           }
+          sellPrice = Math.max(0.01, sellPrice - 0.01);
+          await new Promise((r) => setTimeout(r, 500));
         }
       } catch (e) {
         console.error("[EXIT] err:", e instanceof Error ? e.message : e);
         sellPrice = Math.max(0.01, sellPrice - 0.01);
+        await new Promise((r) => setTimeout(r, 500));
       }
     }
     return sold;
@@ -541,11 +515,12 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
         // 使用增强版卖出函数（检查余额 + sync + 重试）
         const sold = await attemptSell(sig.tokenId, sig, ctx);
+        const sizeToClear = pos?.size ?? sig.size;
         if (sold) {
-          tracker.recordSell(sig.tokenId, sig.size);
+          tracker.recordSell(sig.tokenId, sizeToClear);
         } else {
           console.error("[EXIT] 3次卖出均失败，强制清仓标记");
-          tracker.recordSell(sig.tokenId, sig.size);
+          tracker.recordSell(sig.tokenId, sizeToClear);
         }
       }
 
@@ -685,13 +660,14 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         console.log(`[98C] ${u} | ${d}`);
       }
 
-      // 98c 或 99c：满足价格带即挂单（含趋势拦截 + 深度过滤）
+      // 98c 或 99c：满足价格带即挂单（含趋势拦截 + 深度过滤 + 入场原子锁）
       if (upPr != null) {
+        if (entryLockBySlug.has(slug)) continue;
         if (coin === "btc" && currentBtc != null && getBinanceBtcPrice() != null) {
           const conservativeUp = Math.min(currentBtc, getBinanceBtcPrice()!);
           const actualGapUp = priceToBeat != null ? Math.abs(conservativeUp - priceToBeat) : 0;
           if (priceToBeat != null && actualGapUp < requiredGap) continue;
-          if (isPriceOverextended(conservativeUp, btcPriceHistory)) {
+          if (isPriceOverextended(conservativeUp, getPriceHistory(coin), coin)) {
             if (nowMs % 5000 < 300) console.log("[Anti-V] 侦测到脉冲过载，防止 V 字反杀，拦截 UP 下单");
             continue;
           }
@@ -708,22 +684,31 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           if (nowMs - lastStatusLog < 1000) console.log(`[98C] Up@${upPr} 跳过: canBuy=false (额度/笔数限制)`);
           continue;
         }
-        const signal = { type: "latency" as const, direction: "up" as const, tokenId: ctx.yesTokenId, price: upPr, size, reason: `98/99C Up 挂单` };
-        const r = await executeSignal(client, signal, ctx.tickSize, ctx.negRisk);
-        if (r.ok && r.orderIds[0]) {
-          pendingByKey.set(key, { orderId: r.orderIds[0], tokenId: ctx.yesTokenId, side: "up", size, price: upPr, slug, placedAt: nowMs, marketEndMs: endMs });
-          console.log(`[98C] Up 挂单成功 @${upPr} x${size} orderId=${r.orderIds[0].slice(0, 10)}…`);
-        } else {
-          console.error("[98C] Up 挂单失败:", r.error || "无 orderId");
+        entryLockBySlug.add(slug);
+        try {
+          const signal = { type: "latency" as const, direction: "up" as const, tokenId: ctx.yesTokenId, price: upPr, size, reason: `98/99C Up 挂单` };
+          const r = await executeSignal(client, signal, ctx.tickSize, ctx.negRisk);
+          if (r.ok && r.orderIds[0]) {
+            pendingByKey.set(key, { orderId: r.orderIds[0], tokenId: ctx.yesTokenId, side: "up", size, price: upPr, slug, placedAt: nowMs, marketEndMs: endMs });
+            console.log(`[98C] Up 挂单成功 @${upPr} x${size} orderId=${r.orderIds[0].slice(0, 10)}…`);
+            entryLockBySlug.delete(slug);
+          } else {
+            console.error("[98C] Up 挂单失败:", r.error || "无 orderId");
+            entryLockBySlug.delete(slug);
+          }
+        } catch (e) {
+          entryLockBySlug.delete(slug);
+          console.error("[98C] Up 挂单异常:", e instanceof Error ? e.message : e);
         }
         continue;
       }
       if (downPr != null) {
+        if (entryLockBySlug.has(slug)) continue;
         if (coin === "btc" && currentBtc != null && getBinanceBtcPrice() != null) {
           const conservativeDown = Math.max(currentBtc, getBinanceBtcPrice()!);
           const actualGapDown = priceToBeat != null ? Math.abs(conservativeDown - priceToBeat) : 0;
           if (priceToBeat != null && actualGapDown < requiredGap) continue;
-          if (isPriceOverextended(conservativeDown, btcPriceHistory)) {
+          if (isPriceOverextended(conservativeDown, getPriceHistory(coin), coin)) {
             if (nowMs % 5000 < 300) console.log("[Anti-V] 侦测到脉冲过载，防止 V 字反杀，拦截 DOWN 下单");
             continue;
           }
@@ -740,13 +725,21 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           if (nowMs - lastStatusLog < 1000) console.log(`[98C] Down@${downPr} 跳过: canBuy=false (额度/笔数限制)`);
           continue;
         }
-        const signal = { type: "latency" as const, direction: "down" as const, tokenId: ctx.noTokenId, price: downPr, size, reason: `98/99C Down 挂单` };
-        const r = await executeSignal(client, signal, ctx.tickSize, ctx.negRisk);
-        if (r.ok && r.orderIds[0]) {
-          pendingByKey.set(key, { orderId: r.orderIds[0], tokenId: ctx.noTokenId, side: "down", size, price: downPr, slug, placedAt: nowMs, marketEndMs: endMs });
-          console.log(`[98C] Down 挂单成功 @${downPr} x${size} orderId=${r.orderIds[0].slice(0, 10)}…`);
-        } else {
-          console.error("[98C] Down 挂单失败:", r.error || "无 orderId");
+        entryLockBySlug.add(slug);
+        try {
+          const signal = { type: "latency" as const, direction: "down" as const, tokenId: ctx.noTokenId, price: downPr, size, reason: `98/99C Down 挂单` };
+          const r = await executeSignal(client, signal, ctx.tickSize, ctx.negRisk);
+          if (r.ok && r.orderIds[0]) {
+            pendingByKey.set(key, { orderId: r.orderIds[0], tokenId: ctx.noTokenId, side: "down", size, price: downPr, slug, placedAt: nowMs, marketEndMs: endMs });
+            console.log(`[98C] Down 挂单成功 @${downPr} x${size} orderId=${r.orderIds[0].slice(0, 10)}…`);
+            entryLockBySlug.delete(slug);
+          } else {
+            console.error("[98C] Down 挂单失败:", r.error || "无 orderId");
+            entryLockBySlug.delete(slug);
+          }
+        } catch (e) {
+          entryLockBySlug.delete(slug);
+          console.error("[98C] Down 挂单异常:", e instanceof Error ? e.message : e);
         }
         continue;
       }
