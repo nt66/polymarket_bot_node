@@ -6,9 +6,11 @@ import {
   getCurrentBtcPrice,
   getCurrentEthPrice,
   getCurrentSolPrice,
+  getCurrentXrpPrice,
   getBtcPriceAtTimestamp,
   getEthPriceAtTimestamp,
   getSolPriceAtTimestamp,
+  getXrpPriceAtTimestamp,
 } from "./api/btc-price.js";
 import {
   initBinancePrice,
@@ -23,8 +25,8 @@ import { PositionTracker } from "./risk/position-tracker.js";
 import { logTrade, logRoundEnd } from "./util/daily-log.js";
 import { notifyPnL } from "./notify/telegram.js";
 
-// === 三盘（BTC / ETH / SOL）动态风险配置 ===
-type Coin = "btc" | "eth" | "sol";
+// === 四盘（BTC / ETH / SOL / XRP）动态风险配置 ===
+type Coin = "btc" | "eth" | "sol" | "xrp";
 const VOLATILITY_WINDOW_SIZE = 40;
 
 // 按币种：基础安全价差 + 动量拦截门槛 + 盘口深度限制
@@ -32,17 +34,20 @@ const COIN_CONFIG: Record<Coin, { baseSafeGap: number; momentumThreshold: number
   btc: { baseSafeGap: 15, momentumThreshold: 4.5, maxAskDepthUsd: 4000 },
   eth: { baseSafeGap: 1.2, momentumThreshold: 0.4, maxAskDepthUsd: 1500 },
   sol: { baseSafeGap: 0.22, momentumThreshold: 0.04, maxAskDepthUsd: 600 },
+  xrp: { baseSafeGap: 0.012, momentumThreshold: 0.005, maxAskDepthUsd: 800 },
 };
 
 const btcPriceHistory: number[] = [];
 const ethPriceHistory: number[] = [];
 const solPriceHistory: number[] = [];
+const xrpPriceHistory: number[] = [];
 
 // 从 slug 中提取币种
 function getCoinFromSlug(slug: string): Coin | null {
   if (/^btc-updown-5m-/.test(slug)) return "btc";
   if (/^eth-updown-5m-/.test(slug)) return "eth";
   if (/^sol-updown-5m-/.test(slug)) return "sol";
+  if (/^xrp-updown-5m-/.test(slug)) return "xrp";
   return null;
 }
 
@@ -52,6 +57,7 @@ function getPriceHistory(coin: Coin): number[] {
     case "btc": return btcPriceHistory;
     case "eth": return ethPriceHistory;
     case "sol": return solPriceHistory;
+    case "xrp": return xrpPriceHistory;
   }
 }
 
@@ -62,16 +68,29 @@ function isPriceOverextended(currentPrice: number, history: number[], coin: Coin
   if (history.length < V_GUARD_LONG_LEN) return false;
   const longAvg = history.slice(-V_GUARD_LONG_LEN).reduce((a, b) => a + b, 0) / V_GUARD_LONG_LEN;
   const deviationPercent = Math.abs(currentPrice - longAvg) / longAvg;
-  const threshold = coin === "btc" ? 0.0006 : 0.0012; // BTC 0.06%，ETH/SOL 0.12%
+  const threshold = coin === "btc" ? 0.0006 : 0.0012; // BTC 0.06%，ETH/SOL/XRP 0.12%
   return deviationPercent > threshold;
 }
 
-async function getPriceAtTimestampForCoin(coin: Coin, unixSec: number): Promise<number | null> {
+async function getCurrentPriceByCoin(coin: Coin): Promise<number | null> {
   switch (coin) {
-    case "btc": return getBtcPriceAtTimestamp(unixSec);
-    case "eth": return getEthPriceAtTimestamp(unixSec);
-    case "sol": return getSolPriceAtTimestamp(unixSec);
+    case "btc": return getCurrentBtcPrice();
+    case "eth": return getCurrentEthPrice();
+    case "sol": return getCurrentSolPrice();
+    case "xrp": return getCurrentXrpPrice();
   }
+}
+
+async function getPriceAtTimestampForCoin(coin: Coin, unixSec: number): Promise<number | null> {
+  let price: number | null = null;
+  switch (coin) {
+    case "btc": price = await getBtcPriceAtTimestamp(unixSec); break;
+    case "eth": price = await getEthPriceAtTimestamp(unixSec); break;
+    case "sol": price = await getSolPriceAtTimestamp(unixSec); break;
+    case "xrp": price = await getXrpPriceAtTimestamp(unixSec); break;
+  }
+  // 兜底：K 线缺失（如 XRP 流动性断层）时用当前现货价，防止 Bot 因拿不到历史价而罢工
+  return price ?? (await getCurrentPriceByCoin(coin));
 }
 
 const STOP_FILE = path.join(process.cwd(), ".polymarket-bot-stop");
@@ -99,11 +118,18 @@ function getDynamicBuffer(coin: Coin): number {
 }
 
 /**
- * 按币种的动态时间风险：剩余时间越短要求价差不同；SOL 增加硬性绝对值底线，防止一分钱绝杀
+ * 按币种的动态时间风险：剩余时间越短要求价差不同；SOL/XRP 增加硬性绝对值底线，防止一分钱绝杀
  */
 function getRequiredGapByTime(secsLeft: number, vBuffer: number, coin: Coin): number {
   const base = COIN_CONFIG[coin].baseSafeGap;
   const scale = base / 15;
+
+  // === 针对 XRP 的硬性补丁（价格基数低，用绝对值底线）===
+  if (coin === "xrp") {
+    if (secsLeft > 180) return 0.04;
+    if (secsLeft > 60) return 0.025;
+    return Math.max(0.018, vBuffer + 0.005);
+  }
 
   // === 针对 SOL 的硬性补丁 ===
   if (coin === "sol") {
@@ -196,8 +222,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
   initBinancePrice();
 
-  console.log("=== 98概率买入 盈利及时卖出 (三盘 BTC/ETH/SOL 5min) ===");
-  console.log(`挂单价=${config.buy98OrderPrices.join(",")} | 每次 ${config.buy98OrderSizeShares} shares | 盈利即卖`);
+  console.log("=== 98概率买入 盈利及时卖出 (5min) ===");
+  console.log(`启用盘: ${config.enabledCoins.join(", ").toUpperCase()} | 挂单价=${config.buy98OrderPrices.join(",")} | 每次 ${config.buy98OrderSizeShares} shares | 盈利即卖`);
   console.log("---");
 
   // === 初始化授权（USDC + Outcome tokens） ===
@@ -239,8 +265,15 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
   async function refreshMarkets(): Promise<void> {
     try {
-      const result = await getAll5MinMarketsFast();
+      // 必须显式传入启用盘，避免在只开 btc/eth 时仍拉取全部四盘造成带宽与内存压力
+      const enabledPrefixes = config.enabledCoins.map((c) => `${c}-updown-5m`);
+      const result = await getAll5MinMarketsFast(enabledPrefixes);
       marketResult = result;
+
+      const activeSlugs = new Set(result.inWindow.map((m) => m.slug).filter(Boolean));
+      for (const slug of lastSnapshotBySlug.keys()) if (!activeSlugs.has(slug)) lastSnapshotBySlug.delete(slug);
+      for (const slug of priceToBeatBySlug.keys()) if (!activeSlugs.has(slug)) priceToBeatBySlug.delete(slug);
+
       if (result.inWindow.length > 0) {
         const info = result.inWindow.map((m) => {
           const endMs = m.endDate ? new Date(m.endDate).getTime() : 0;
@@ -262,7 +295,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   let lastStatusLog = 0;
   const STATUS_LOG_MS = 30000;
 
-  // === 卖出辅助：虚拟余额抢跑，不等待链上到账，利用 CLOB 部分成交实现毫秒级止盈 ===
+  // === 卖出辅助：虚拟余额抢跑 + 以 Best Bid 减一 tick 挂卖确保抢跑（低币价品种不用固定 0.01 步长）===
   async function attemptSell(
     tokenId: string,
     sig: { tokenId: string; side: "SELL"; price: number; size: number; reason: string; type: string },
@@ -272,10 +305,12 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     if (!pos) return false;
 
     const virtualSize = pos.size;
-    console.log(`[EXIT-Fast] 触发虚拟止盈: ${sig.reason} | 预估数量: ${virtualSize}`);
+    const tickSize = parseFloat(ctx.tickSize || "0.01");
+    const currentBid = sig.price;
+    let sellPrice = Math.max(0.01, currentBid - tickSize);
+    console.log(`[EXIT-Fast] 触发虚拟止盈: ${sig.reason} | 预估数量: ${virtualSize} | 卖价: ${sellPrice} (bid - 1tick)`);
 
     let sold = false;
-    let sellPrice = sig.price;
 
     for (let attempt = 0; attempt < 3 && !sold; attempt++) {
       try {
@@ -292,12 +327,12 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           if (r.error?.includes("balance")) {
             await client!.syncTokenBalance(tokenId);
           }
-          sellPrice = Math.max(0.01, sellPrice - 0.01);
+          sellPrice = Math.max(0.01, sellPrice - tickSize);
           await new Promise((r) => setTimeout(r, 500));
         }
       } catch (e) {
         console.error("[EXIT] err:", e instanceof Error ? e.message : e);
-        sellPrice = Math.max(0.01, sellPrice - 0.01);
+        sellPrice = Math.max(0.01, sellPrice - tickSize);
         await new Promise((r) => setTimeout(r, 500));
       }
     }
@@ -336,12 +371,15 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
     if (activeMarkets.length === 0) return;
 
-    // --- 实时更新三盘价格历史（用于动态价差与动量拦截）---
-    const [currentBtc, currentEth, currentSol] = await Promise.all([
-      getCurrentBtcPrice(),
-      getCurrentEthPrice(),
-      getCurrentSolPrice(),
-    ]);
+    // --- 仅对启用的盘拉价并更新价格历史（用于动态价差与动量拦截）---
+    const enabledSet = new Set(config.enabledCoins);
+    const pricePromises: Promise<number | null>[] = [
+      enabledSet.has("btc") ? getCurrentBtcPrice() : Promise.resolve(null),
+      enabledSet.has("eth") ? getCurrentEthPrice() : Promise.resolve(null),
+      enabledSet.has("sol") ? getCurrentSolPrice() : Promise.resolve(null),
+      enabledSet.has("xrp") ? getCurrentXrpPrice() : Promise.resolve(null),
+    ];
+    const [currentBtc, currentEth, currentSol, currentXrp] = await Promise.all(pricePromises);
     if (currentBtc != null) {
       btcPriceHistory.push(currentBtc);
       if (btcPriceHistory.length > VOLATILITY_WINDOW_SIZE) btcPriceHistory.shift();
@@ -353,6 +391,10 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     if (currentSol != null) {
       solPriceHistory.push(currentSol);
       if (solPriceHistory.length > VOLATILITY_WINDOW_SIZE) solPriceHistory.shift();
+    }
+    if (currentXrp != null) {
+      xrpPriceHistory.push(currentXrp);
+      if (xrpPriceHistory.length > VOLATILITY_WINDOW_SIZE) xrpPriceHistory.shift();
     }
 
     // 双交易所静默：OKX 与 Binance 价差过大则本 tick 不新开单
@@ -400,7 +442,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       if (!activeSlugs.has(p.slug)) {
         const roundTarget = roundEndBtcPriceToBeat.get(p.slug);
         const roundCoin = getCoinFromSlug(p.slug);
-        const roundCur = roundCoin === "btc" ? currentBtc : roundCoin === "eth" ? currentEth : currentSol;
+        const roundCur =
+          roundCoin === "btc" ? currentBtc : roundCoin === "eth" ? currentEth : roundCoin === "sol" ? currentSol : currentXrp;
         const roundPriceStr =
           roundTarget != null && roundCur != null && roundCoin != null
             ? ` | ${roundCoin.toUpperCase()} 目标=${roundTarget.toFixed(2)} 当前=${roundCur.toFixed(2)}`
@@ -441,7 +484,10 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       );
       const slug = market.slug || "";
       const coin = getCoinFromSlug(slug);
-      const currentPrice = coin != null ? (coin === "btc" ? currentBtc : coin === "eth" ? currentEth : currentSol) : null;
+      const currentPrice =
+        coin != null
+          ? (coin === "btc" ? currentBtc : coin === "eth" ? currentEth : coin === "sol" ? currentSol : currentXrp)
+          : null;
       const currentBids = new Map<string, { price: number; size: number }>();
       if (ctx.yesBook?.bids?.[0]) {
         currentBids.set(ctx.yesTokenId, {

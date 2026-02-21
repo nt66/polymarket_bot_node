@@ -9,6 +9,7 @@ import { fetchBtcPriceHttp, fetchSpotPriceHttp, fetchOkxCandleOpenHttp } from ".
 let cachedBtc: { price: number; at: number } | null = null;
 let cachedEth: { price: number; at: number } | null = null;
 let cachedSol: { price: number; at: number } | null = null;
+let cachedXrp: { price: number; at: number } | null = null;
 const CACHE_MS = 1000;
 
 /**
@@ -63,4 +64,22 @@ export async function getEthPriceAtTimestamp(unixSec: number): Promise<number | 
  */
 export async function getSolPriceAtTimestamp(unixSec: number): Promise<number | null> {
   return fetchOkxCandleOpenHttp("SOL-USDT", unixSec);
+}
+
+/**
+ * 当前 XRP 价格（美元）
+ */
+export async function getCurrentXrpPrice(): Promise<number | null> {
+  const now = Date.now();
+  if (cachedXrp && now - cachedXrp.at < CACHE_MS) return cachedXrp.price;
+  const price = await fetchSpotPriceHttp("XRP-USDT");
+  if (price != null) cachedXrp = { price, at: now };
+  return price ?? null;
+}
+
+/**
+ * 指定 Unix 秒时刻的 XRP 价格（用于 5min 市场的 Price to Beat，OKX 1m K 线开盘价）
+ */
+export async function getXrpPriceAtTimestamp(unixSec: number): Promise<number | null> {
+  return fetchOkxCandleOpenHttp("XRP-USDT", unixSec);
 }

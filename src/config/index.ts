@@ -2,6 +2,10 @@
  * 配置模块：从环境变量加载（98 概率买入 Bot 仅需以下项）
  */
 
+/** 支持的盘：仅在此列表中的币种会被拉取和交易 */
+export const VALID_COINS = ["btc", "eth", "sol", "xrp"] as const;
+export type EnabledCoin = (typeof VALID_COINS)[number];
+
 export interface EnvConfig {
   // Polymarket 必填
   privateKey: string;
@@ -10,6 +14,8 @@ export interface EnvConfig {
   polyApiKey?: string;
   polySecret?: string;
   polyPassphrase?: string;
+  /** 启用的盘（逗号分隔，如 btc,eth,sol；不填或空则跑全部四盘） */
+  enabledCoins: EnabledCoin[];
   // 98 概率买入（BTC 5min）
   /** 每次买入多少 shares（固定张数） */
   buy98OrderSizeShares: number;
@@ -23,10 +29,13 @@ export interface EnvConfig {
   tgChatId?: string;
 }
 
+const defaultEnabledCoins: EnabledCoin[] = [...VALID_COINS];
+
 const defaultConfig: EnvConfig = {
   privateKey: "",
   funderAddress: "",
   signatureType: 2,
+  enabledCoins: defaultEnabledCoins,
   buy98OrderSizeShares: 20,
   buy98OrderMaxPositionPerMarket: 150,
   buy98OrderPrices: [0.99, 0.98],
@@ -49,6 +58,15 @@ function parseNumList(val: string | undefined, def: number[]): number[] {
   return Array.from(new Set(out)).sort((a, b) => b - a);
 }
 
+function parseEnabledCoins(val: string | undefined): EnabledCoin[] {
+  if (val === undefined || val === "") return defaultEnabledCoins;
+  const list = val
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s): s is EnabledCoin => VALID_COINS.includes(s as EnabledCoin));
+  return list.length === 0 ? defaultEnabledCoins : [...new Set(list)];
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
   return {
     privateKey: env.PRIVATE_KEY ?? defaultConfig.privateKey,
@@ -57,6 +75,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     polyApiKey: env.POLY_API_KEY,
     polySecret: env.POLY_SECRET,
     polyPassphrase: env.POLY_PASSPHRASE,
+    enabledCoins: parseEnabledCoins(env.ENABLED_COINS),
 
     buy98OrderSizeShares: parseNum(env.BUY98_ORDER_SIZE_SHARES, defaultConfig.buy98OrderSizeShares),
     buy98OrderMaxPositionPerMarket: parseNum(env.BUY98_MAX_POSITION_PER_MARKET, defaultConfig.buy98OrderMaxPositionPerMarket),

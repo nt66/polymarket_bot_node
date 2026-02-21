@@ -296,21 +296,23 @@ export async function getBtc5MinMarketsFast(): Promise<Btc15mResult> {
   return { allMarkets, inWindow, upcoming, nextStartsInSec };
 }
 
-const FIVE_MIN_PREFIXES = ["btc-updown-5m", "eth-updown-5m", "sol-updown-5m"] as const;
+const FIVE_MIN_PREFIXES_DEFAULT = ["btc-updown-5m", "eth-updown-5m", "sol-updown-5m", "xrp-updown-5m"] as const;
 
 /**
- * 获取 BTC + ETH + SOL 三盘 5min 市场（轻量版）。
- * 只拉当前/上一/下一轮共 9 个 slug（3 币种 × 3 时间窗），合并 inWindow / upcoming。
+ * 获取指定盘的 5min 市场（轻量版）。
+ * @param prefixes 只拉这些前缀的市场（如 ["btc-updown-5m","eth-updown-5m"]）；不传则拉全部四盘。
+ * 只拉当前/上一/下一轮（每盘 3 个时间窗），合并 inWindow / upcoming。
  */
-export async function getAll5MinMarketsFast(): Promise<Btc15mResult> {
+export async function getAll5MinMarketsFast(prefixes?: string[]): Promise<Btc15mResult> {
   const nowSec = Date.now() / 1000;
   const currentSlotStart = Math.floor(nowSec / FIVE_MIN_SEC) * FIVE_MIN_SEC;
   const prevSlot = currentSlotStart - FIVE_MIN_SEC;
   const nextSlot = currentSlotStart + FIVE_MIN_SEC;
   const slots = [prevSlot, currentSlotStart, nextSlot];
 
+  const prefixList = prefixes && prefixes.length > 0 ? prefixes : [...FIVE_MIN_PREFIXES_DEFAULT];
   const slugs: string[] = [];
-  for (const prefix of FIVE_MIN_PREFIXES) {
+  for (const prefix of prefixList) {
     for (const ts of slots) {
       slugs.push(`${prefix}-${ts}`);
     }
