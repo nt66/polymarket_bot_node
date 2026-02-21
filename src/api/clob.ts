@@ -86,6 +86,9 @@ export interface PolymarketClient {
   /** 取消所有挂单 */
   cancelAll(): Promise<void>;
 
+  /** 取消指定市场的挂单（用于卖出前清场，避免旧单干扰） */
+  cancelMarketOrders(params: { market: string }): Promise<void>;
+
   /** 取消指定挂单（用于 98C 买不进则撤） */
   cancelOrder(orderId: string): Promise<boolean>;
 
@@ -175,6 +178,15 @@ export async function createPolymarketClient(config: EnvConfig): Promise<Polymar
         console.log("[Orders] 所有挂单已取消");
       } catch (e) {
         console.log("[Orders] cancelAll:", e instanceof Error ? e.message : e);
+      }
+    },
+
+    async cancelMarketOrders(params: { market: string }): Promise<void> {
+      try {
+        await tradingClient.cancelMarketOrders(params);
+        console.log("[Orders] 该市场挂单已取消");
+      } catch (e) {
+        console.log("[Orders] cancelMarketOrders:", e instanceof Error ? e.message : e);
       }
     },
 

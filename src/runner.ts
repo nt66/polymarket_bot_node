@@ -68,7 +68,7 @@ function isPriceOverextended(currentPrice: number, history: number[], coin: Coin
   if (history.length < V_GUARD_LONG_LEN) return false;
   const longAvg = history.slice(-V_GUARD_LONG_LEN).reduce((a, b) => a + b, 0) / V_GUARD_LONG_LEN;
   const deviationPercent = Math.abs(currentPrice - longAvg) / longAvg;
-  const threshold = coin === "btc" ? 0.0006 : 0.0012; // BTC 0.06%，ETH/SOL/XRP 0.12%
+  const threshold = coin === "btc" ? 0.0006 : coin === "xrp" ? 0.0008 : 0.0012; // BTC 0.06%，XRP 0.08%，ETH/SOL 0.12%
   return deviationPercent > threshold;
 }
 
@@ -295,7 +295,7 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   let lastStatusLog = 0;
   const STATUS_LOG_MS = 30000;
 
-  // === 卖出辅助：虚拟余额抢跑 + 以 Best Bid 减一 tick 挂卖确保抢跑（低币价品种不用固定 0.01 步长）===
+  // === 卖出辅助：虚拟余额抢跑 + 激进卖价（XRP 减 2 tick 抢跑）；卖出前撤掉该市场旧挂单 ===
   async function attemptSell(
     tokenId: string,
     sig: { tokenId: string; side: "SELL"; price: number; size: number; reason: string; type: string },
@@ -304,14 +304,24 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     const pos = tracker.getPosition(tokenId);
     if (!pos) return false;
 
+    const slug = pos.marketSlug;
     const virtualSize = pos.size;
     const tickSize = parseFloat(ctx.tickSize || "0.01");
-    const currentBid = sig.price;
-    let sellPrice = Math.max(0.01, currentBid - tickSize);
-    console.log(`[EXIT-Fast] 触发虚拟止盈: ${sig.reason} | 预估数量: ${virtualSize} | 卖价: ${sellPrice} (bid - 1tick)`);
+
+    // 暴力清场：撤掉该市场所有挂单，防止旧单干扰余额或逻辑
+    try {
+      await client!.cancelMarketOrders({ market: ctx.market.conditionId });
+    } catch (e) {
+      console.error(`[EXIT-Pre] 撤单失败(非致命):`, e);
+    }
+
+    // 更激进的卖价：XRP 快节奏盘口减 2 tick 抢跑，其余 1 tick
+    const coin = getCoinFromSlug(slug);
+    const dropTicks = coin === "xrp" ? 2 : 1;
+    let sellPrice = Math.max(0.01, sig.price - tickSize * dropTicks);
+    console.log(`[EXIT-Fast] 触发虚拟止盈: ${sig.reason} | 数量: ${virtualSize} | 激进卖价: ${sellPrice}`);
 
     let sold = false;
-
     for (let attempt = 0; attempt < 3 && !sold; attempt++) {
       try {
         const r = await executeSignal(
@@ -324,16 +334,13 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           console.log(`[EXIT-Success] 卖单已挂出: ${r.orderIds} @${sellPrice} x${virtualSize}`);
           sold = true;
         } else {
-          if (r.error?.includes("balance")) {
-            await client!.syncTokenBalance(tokenId);
-          }
+          if (r.error?.includes("balance")) await client!.syncTokenBalance(tokenId);
           sellPrice = Math.max(0.01, sellPrice - tickSize);
-          await new Promise((r) => setTimeout(r, 500));
+          await new Promise((r) => setTimeout(r, 400));
         }
       } catch (e) {
-        console.error("[EXIT] err:", e instanceof Error ? e.message : e);
         sellPrice = Math.max(0.01, sellPrice - tickSize);
-        await new Promise((r) => setTimeout(r, 500));
+        await new Promise((r) => setTimeout(r, 400));
       }
     }
     return sold;
