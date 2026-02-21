@@ -10,6 +10,11 @@ import {
   getEthPriceAtTimestamp,
   getSolPriceAtTimestamp,
 } from "./api/btc-price.js";
+import {
+  initBinancePrice,
+  getBinanceBtcPrice,
+  DUAL_EXCHANGE_DIVERGENCE_THRESHOLD,
+} from "./api/binance-ws.js";
 import type { GammaMarket, Btc15mResult } from "./api/gamma.js";
 import type { MarketContext } from "./strategies/types.js";
 import { executeSignal } from "./execution/executor.js";
@@ -48,6 +53,18 @@ function getPriceHistory(coin: Coin): number[] {
     case "eth": return ethPriceHistory;
     case "sol": return solPriceHistory;
   }
+}
+
+/** V 字防护：价格相对 20 点均值偏离超过阈值视为脉冲末端，易 V 字反杀 */
+const V_GUARD_DEVIATION_USD = 40;
+const V_GUARD_SHORT_LEN = 5;
+const V_GUARD_LONG_LEN = 20;
+
+function isPriceOverextended(currentPrice: number, history: number[]): boolean {
+  if (history.length < V_GUARD_LONG_LEN) return false;
+  const shortAvg = history.slice(-V_GUARD_SHORT_LEN).reduce((a, b) => a + b, 0) / V_GUARD_SHORT_LEN;
+  const longAvg = history.slice(-V_GUARD_LONG_LEN).reduce((a, b) => a + b, 0) / V_GUARD_LONG_LEN;
+  return Math.abs(currentPrice - longAvg) > V_GUARD_DEVIATION_USD;
 }
 
 async function getPriceAtTimestampForCoin(coin: Coin, unixSec: number): Promise<number | null> {
@@ -177,6 +194,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
   }
 
   clearStopFile();
+
+  initBinancePrice();
 
   console.log("=== 98概率买入 盈利及时卖出 (三盘 BTC/ETH/SOL 5min) ===");
   console.log(`挂单价=${config.buy98OrderPrices.join(",")} | 每次 ${config.buy98OrderSizeShares} shares | 盈利即卖`);
@@ -360,6 +379,16 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
     if (currentSol != null) {
       solPriceHistory.push(currentSol);
       if (solPriceHistory.length > VOLATILITY_WINDOW_SIZE) solPriceHistory.shift();
+    }
+
+    // 双交易所静默：OKX 与 Binance 价差过大则本 tick 不新开单
+    const binanceBtc = getBinanceBtcPrice();
+    const dualExchangeSilent =
+      currentBtc != null &&
+      binanceBtc != null &&
+      Math.abs(currentBtc - binanceBtc) > DUAL_EXCHANGE_DIVERGENCE_THRESHOLD;
+    if (dualExchangeSilent && nowMs % 5000 < 300) {
+      console.log(`[Risk-Dual] 两大所分歧 $${Math.abs(currentBtc! - binanceBtc!).toFixed(2)}，拦截交易`);
     }
 
     // 获取订单簿
@@ -552,7 +581,9 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
           priceToBeat = p;
         }
       }
-      if (priceToBeat != null && currentPrice != null) {
+      // 价差门槛：BTC 且有两所价格时在 UP/DOWN 分支里用保守价判断，此处不拦
+      const btcDualSource = coin === "btc" && getBinanceBtcPrice() != null;
+      if (!btcDualSource && priceToBeat != null && currentPrice != null) {
         const actualGap = Math.abs(currentPrice - priceToBeat);
         if (actualGap < requiredGap) {
           if (nowMs % 4000 < 300) {
@@ -641,6 +672,8 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
       const hasPendingForSlug = Array.from(pendingByKey.keys()).some((k) => k.startsWith(`${slug}:`));
       if (hasPendingForSlug) continue;
 
+      if (dualExchangeSilent) continue;
+
       const size = orderShares;
       const upPr = pickPrice(upAsk, upBid);
       const downPr = pickPrice(downAsk, downBid);
@@ -654,6 +687,15 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
 
       // 98c 或 99c：满足价格带即挂单（含趋势拦截 + 深度过滤）
       if (upPr != null) {
+        if (coin === "btc" && currentBtc != null && getBinanceBtcPrice() != null) {
+          const conservativeUp = Math.min(currentBtc, getBinanceBtcPrice()!);
+          const actualGapUp = priceToBeat != null ? Math.abs(conservativeUp - priceToBeat) : 0;
+          if (priceToBeat != null && actualGapUp < requiredGap) continue;
+          if (isPriceOverextended(conservativeUp, btcPriceHistory)) {
+            if (nowMs % 5000 < 300) console.log("[Anti-V] 侦测到脉冲过载，防止 V 字反杀，拦截 UP 下单");
+            continue;
+          }
+        }
         if (isMomentumDangerous("up", coin) || isTooDeep(upAskSize)) {
           console.log(`[Risk] ${coin.toUpperCase()} 趋势下杀或深度过大，取消 UP 挂单`);
           continue;
@@ -677,6 +719,15 @@ export async function run(options: RunnerOptions = {}): Promise<void> {
         continue;
       }
       if (downPr != null) {
+        if (coin === "btc" && currentBtc != null && getBinanceBtcPrice() != null) {
+          const conservativeDown = Math.max(currentBtc, getBinanceBtcPrice()!);
+          const actualGapDown = priceToBeat != null ? Math.abs(conservativeDown - priceToBeat) : 0;
+          if (priceToBeat != null && actualGapDown < requiredGap) continue;
+          if (isPriceOverextended(conservativeDown, btcPriceHistory)) {
+            if (nowMs % 5000 < 300) console.log("[Anti-V] 侦测到脉冲过载，防止 V 字反杀，拦截 DOWN 下单");
+            continue;
+          }
+        }
         if (isMomentumDangerous("down", coin) || isTooDeep(downAskSize)) {
           console.log(`[Risk] ${coin.toUpperCase()} 趋势上涨或深度过大，取消 DOWN 挂单`);
           continue;
